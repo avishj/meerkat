@@ -225,7 +225,7 @@ impl Display for Value {
                 params,
                 body,
                 env,
-                service_name,
+                ..
             } => write!(f, "fn({})[{:?}]{{{}}}", params.join(","), env, body),
             Value::ActionClosure {
                 stmts,
@@ -240,7 +240,7 @@ impl Display for Expr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Expr::Literal { val } => write!(f, "{}", val),
-            Expr::Tuple { val } => write!(f, "vector"),
+            Expr::Tuple { .. } => write!(f, "vector"),
             Expr::KeyVal { key, value } => write!(f, "keyval: {}, {}", key, value),
             Expr::Variable { ident } => write!(f, "{}", ident),
             Expr::Unop { op, expr } => write!(f, "{}{}", op, expr),
