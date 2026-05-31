@@ -3,8 +3,9 @@
 //! Simplified implementation for issue #19. The existing transaction.rs
 //! and lock.rs provide the full actor-based infrastructure for future use.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
+use crate::runtime::ast::Value;
 
 /// A globally unique transaction identifier.
 /// Older timestamp = higher priority (for future wait-die implementation).
@@ -152,6 +153,34 @@ impl VarState {
             value,
             lock: VarLock::new(),
             latest_write_txn: None,
+        }
+    }
+}
+
+/// Per-transaction state, owned by the code executing a transaction and passed
+/// around during execution rather than stored on the Manager. A single Manager
+/// may eventually run multiple transactions concurrently, so transaction state
+/// must not live on the Manager.
+#[derive(Debug)]
+pub struct Transaction {
+    /// Globally unique transaction identifier.
+    pub id: TxnId,
+    /// Variables this transaction currently holds a lock on.
+    pub locked: HashSet<String>,
+    /// Values already read in this transaction (avoids re-fetching, including
+    /// redundant network round-trips for remote reads).
+    pub read_cache: HashMap<String, Value>,
+    /// Variables written by this transaction (recorded at commit).
+    pub written: HashSet<String>,
+}
+
+impl Transaction {
+    pub fn new(id: TxnId) -> Self {
+        Transaction {
+            id,
+            locked: HashSet::new(),
+            read_cache: HashMap::new(),
+            written: HashSet::new(),
         }
     }
 }
