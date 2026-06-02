@@ -170,8 +170,10 @@ pub struct Transaction {
     /// Values already read in this transaction (avoids re-fetching, including
     /// redundant network round-trips for remote reads).
     pub read_cache: HashMap<String, Value>,
-    /// Variables written by this transaction (recorded at commit).
-    pub written: HashSet<String>,
+    /// Values written by this transaction, buffered and applied to the
+    /// service only on successful commit (so a failed transaction leaves no
+    /// partial writes).
+    pub written: HashMap<String, Value>,
 }
 
 impl Transaction {
@@ -180,7 +182,7 @@ impl Transaction {
             id,
             locked: HashSet::new(),
             read_cache: HashMap::new(),
-            written: HashSet::new(),
+            written: HashMap::new(),
         }
     }
 }
