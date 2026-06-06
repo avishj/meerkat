@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 use crate::runtime::ast::Value;
+use crate::net::ServiceId;
 
 /// A globally unique transaction identifier.
 /// Older timestamp = higher priority (for future wait-die implementation).
@@ -165,15 +166,15 @@ impl VarState {
 pub struct Transaction {
     /// Globally unique transaction identifier.
     pub id: TxnId,
-    /// Variables this transaction currently holds a lock on.
-    pub locked: HashSet<String>,
-    /// Values already read in this transaction (avoids re-fetching, including
-    /// redundant network round-trips for remote reads).
-    pub read_cache: HashMap<String, Value>,
-    /// Values written by this transaction, buffered and applied to the
-    /// service only on successful commit (so a failed transaction leaves no
-    /// partial writes).
-    pub written: HashMap<String, Value>,
+    /// (service, variable) pairs this transaction currently holds a lock on.
+    pub locked: HashSet<(ServiceId, String)>,
+    /// Values already read in this transaction, keyed by (service, variable)
+    /// (avoids re-fetching, including redundant network round-trips).
+    pub read_cache: HashMap<(ServiceId, String), Value>,
+    /// Values written by this transaction, keyed by (service, variable),
+    /// buffered and applied only on successful commit (so a failed transaction
+    /// leaves no partial writes).
+    pub written: HashMap<(ServiceId, String), Value>,
 }
 
 impl Transaction {

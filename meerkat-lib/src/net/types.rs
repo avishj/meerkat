@@ -17,6 +17,28 @@ impl Address {
     }
 }
 
+/// Globally unique identity of a *service* (as opposed to a node).
+///
+/// Per the Historiographer design, a service identity is its global,
+/// internet-routable network address including the service slug, e.g.
+/// "/ip4/203.0.113.10/tcp/9000/p2p/12D3.../my_service". This is used as part
+/// of the key for all transaction state that mentions a variable, so that the
+/// same variable name in two different services (possibly on different nodes)
+/// never collides.
+///
+/// For local-only execution where the node has no network address yet, the
+/// identity falls back to the service name. On a single node names are
+/// unambiguous; the address-based identity takes over once networking is
+/// available (and is required for cross-node transactions).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ServiceId(pub String);
+
+impl ServiceId {
+    pub fn new(id: impl Into<String>) -> Self {
+        ServiceId(id.into())
+    }
+}
+
 /// Message types in the Meerkat protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MeerkatMessage {

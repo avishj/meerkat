@@ -5,10 +5,12 @@ use tokio::time::Duration;
 use super::ast::{Value, Decl, Expr, ActionStmt};
 use super::interpreter::{eval, EvalContext, EvalError, execute, ExecuteEffect};
 use super::semantic_analysis::var_analysis::{calc_dep_srv, DependAnalysis};
-use crate::net::{Address, NetworkCommand, NetworkEvent, MeerkatMessage, NetworkActor};
+use crate::net::{Address, ServiceId, NetworkCommand, NetworkEvent, MeerkatMessage, NetworkActor};
 use crate::net::network_layer::NetworkLayer;
 
 pub struct Service {
+    /// Globally unique identity of this service (address-based when networked).
+    pub id: ServiceId,
     pub name: String,
     /// Per-variable state: value, lock, and latest write transaction in one place
     pub vars: HashMap<String, VarState>,
@@ -36,12 +38,26 @@ impl Manager {
         }
     }
 
+    /// Compute the global identity of a service owned by this node. When the
+    /// node has a network address, the identity is that address plus the service
+    /// slug; otherwise it falls back to the bare name for local-only execution.
+    async fn service_identity(&mut self, name: &str) -> ServiceId {
+        let addr = self.local_reply_addr().await;
+        if addr.is_empty() {
+            ServiceId::new(name)
+        } else {
+            ServiceId::new(format!("{}/{}", addr, name))
+        }
+    }
+
     pub async fn create_service(&mut self, name: String, decls: Vec<Decl>)
         -> Result<(), EvalError>
     {
         let dep = calc_dep_srv(&decls);
 
+        let id = self.service_identity(&name).await;
         let mut service = Service {
+            id,
             name: name.clone(),
             vars: HashMap::new(),
             defs: HashMap::new(),
@@ -96,21 +112,22 @@ impl Manager {
 
         // Local var read. If inside a transaction, return the cached value if
         // present, otherwise acquire a read lock lazily and cache the value.
-        // Decide what's needed first (ending the txn borrow) before calling
-        // self.acquire_read_lock, then re-borrow txn to record the lock.
+        // Transaction state is keyed by (service id, variable) so the same name
+        // in different services never collides.
+        let key = (self.id_for_service(service_name), ident.to_string());
         let mut need_read_lock: Option<TxnId> = None;
         if let Some(t) = txn.as_deref() {
-            if let Some(cached) = t.read_cache.get(ident) {
+            if let Some(cached) = t.read_cache.get(&key) {
                 return Ok(cached.clone());
             }
-            if !t.locked.contains(ident) {
+            if !t.locked.contains(&key) {
                 need_read_lock = Some(t.id.clone());
             }
         }
         if let Some(txn_id) = need_read_lock {
             self.acquire_read_lock(service_name, ident, &txn_id)?;
             if let Some(t) = txn.as_deref_mut() {
-                t.locked.insert(ident.to_string());
+                t.locked.insert(key.clone());
             }
         }
 
@@ -119,7 +136,7 @@ impl Manager {
             if let Some(var_state) = service.vars.get(ident) {
                 let value = var_state.value.clone();
                 if let Some(t) = txn.as_deref_mut() {
-                    t.read_cache.insert(ident.to_string(), value.clone());
+                    t.read_cache.insert(key, value.clone());
                 }
                 return Ok(value);
             }
@@ -133,10 +150,11 @@ impl Manager {
         // write. The buffered value is applied to the service only at commit, so
         // a transaction that fails partway leaves no partial writes behind.
         if txn.is_some() {
+            let key = (self.id_for_service(service_name), var.to_string());
             enum LockAction { Acquire, Upgrade }
             let (txn_id, kind) = {
                 let t = txn.as_deref().unwrap();
-                let kind = if t.locked.contains(var) { LockAction::Upgrade } else { LockAction::Acquire };
+                let kind = if t.locked.contains(&key) { LockAction::Upgrade } else { LockAction::Acquire };
                 (t.id.clone(), kind)
             };
             match kind {
@@ -144,10 +162,10 @@ impl Manager {
                 LockAction::Acquire => self.acquire_write_lock(service_name, var, &txn_id)?,
             }
             if let Some(t) = txn.as_deref_mut() {
-                t.locked.insert(var.to_string());
-                t.written.insert(var.to_string(), value.clone());
+                t.locked.insert(key.clone());
+                t.written.insert(key.clone(), value.clone());
                 // Reads later in the same transaction see the buffered write
-                t.read_cache.insert(var.to_string(), value);
+                t.read_cache.insert(key, value);
             }
             return Ok(());
         }
@@ -395,6 +413,25 @@ impl Manager {
         }
     }
 
+    /// Resolve an in-scope service name to its global ServiceId. For a known
+    /// local service this is its stored id; otherwise it falls back to a
+    /// name-based id (used until remote service identities are wired up).
+    fn id_for_service(&self, service_name: &str) -> ServiceId {
+        self.services.get(service_name)
+            .map(|s| s.id.clone())
+            .unwrap_or_else(|| ServiceId::new(service_name))
+    }
+
+    /// Find a local service (mutably) by its ServiceId.
+    fn service_by_id_mut(&mut self, id: &ServiceId) -> Option<&mut Service> {
+        self.services.values_mut().find(|s| &s.id == id)
+    }
+
+    /// Find the in-scope name of a local service from its ServiceId.
+    fn name_for_id(&self, id: &ServiceId) -> Option<String> {
+        self.services.iter().find(|(_, s)| &s.id == id).map(|(n, _)| n.clone())
+    }
+
     /// Try to acquire a write lock on a service variable.
     /// Returns LockConflict if the variable is already locked.
     fn acquire_write_lock(&mut self, service_name: &str, var: &str, txn_id: &TxnId) -> Result<(), EvalError> {
@@ -444,9 +481,9 @@ impl Manager {
     }
 
     /// Release all locks held by txn_id on the given variables.
-    fn release_locks(&mut self, service_name: &str, vars: &HashSet<String>, txn_id: &TxnId) {
-        if let Some(service) = self.services.get_mut(service_name) {
-            for var in vars {
+    fn release_locks(&mut self, locked: &HashSet<(ServiceId, String)>, txn_id: &TxnId) {
+        for (sid, var) in locked {
+            if let Some(service) = self.service_by_id_mut(sid) {
                 if let Some(var_state) = service.vars.get_mut(var) {
                     var_state.lock.release(txn_id);
                 }
@@ -495,28 +532,32 @@ impl Manager {
         // nothing is applied, so the transaction leaves no partial writes.
         let mut commit_error: Option<EvalError> = None;
         if exec_error.is_none() {
-            let writes: Vec<(String, Value)> = txn.written.iter()
+            let writes: Vec<((ServiceId, String), Value)> = txn.written.iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            for (var, value) in &writes {
-                if let Some(service) = self.services.get_mut(service_name) {
+            let txn_id = txn.id.clone();
+            for ((sid, var), value) in &writes {
+                if let Some(service) = self.service_by_id_mut(sid) {
                     if let Some(var_state) = service.vars.get_mut(var) {
                         var_state.value = value.clone();
-                        var_state.latest_write_txn = Some(txn.id.clone());
+                        var_state.latest_write_txn = Some(txn_id.clone());
                     }
                 }
             }
-            // Propagate after all writes are applied so defs see a consistent state
-            for (var, _) in &writes {
-                if let Err(e) = self.propagate(service_name, var).await {
-                    commit_error = Some(e);
-                    break;
+            // Propagate after all writes are applied so defs see a consistent
+            // state. Propagation is per owning service, resolved from its id.
+            for ((sid, var), _) in &writes {
+                if let Some(name) = self.name_for_id(sid) {
+                    if let Err(e) = self.propagate(&name, var).await {
+                        commit_error = Some(e);
+                        break;
+                    }
                 }
             }
         }
 
         // Release all locks (always, even on error)
-        self.release_locks(service_name, &txn.locked, &txn.id);
+        self.release_locks(&txn.locked, &txn.id);
 
         match exec_error.or(commit_error) {
             Some(e) => Err(e),
@@ -739,5 +780,51 @@ mod tests {
         // and the lock was released
         let lock = &manager.services.get("foo").unwrap().vars.get("x").unwrap().lock;
         assert!(matches!(lock, crate::runtime::txn::VarLock::Unlocked));
+    }
+
+    // A transaction beginning in s1 composes an action defined in s2 (the
+    // example from issue #44). Both services' writes must commit under the one
+    // transaction, and the (service id, var) keying must keep them distinct.
+    #[tokio::test]
+    async fn test_txn_cross_service_composition() {
+        let mut manager = Manager::new();
+        // s2 owns w and an action that bumps it.
+        let bump = Expr::Action(vec![ActionStmt::Assign {
+            var: "w".to_string(),
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable { ident: "w".to_string() }),
+                expr2: Box::new(Expr::Literal { val: Value::Number { val: 5 } }),
+            },
+        }]);
+        manager.create_service("s2".to_string(), vec![
+            Decl::VarDecl { name: "w".to_string(), val: Expr::Literal { val: Value::Number { val: 10 } } },
+            Decl::DefDecl { name: "bump".to_string(), val: bump, is_pub: true },
+        ]).await.unwrap();
+        // s1 owns x.
+        manager.create_service("s1".to_string(), vec![
+            Decl::VarDecl { name: "x".to_string(), val: Expr::Literal { val: Value::Number { val: 0 } } },
+        ]).await.unwrap();
+
+        // Transaction on s1: x = x + 1; do s2.bump;
+        let stmts = vec![
+            ActionStmt::Assign {
+                var: "x".to_string(),
+                expr: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable { ident: "x".to_string() }),
+                    expr2: Box::new(Expr::Literal { val: Value::Number { val: 1 } }),
+                },
+            },
+            ActionStmt::Do(Expr::MemberAccess { service: "s2".to_string(), member: "bump".to_string() }),
+        ];
+        manager.execute_action("s1", &stmts).await.unwrap();
+
+        // Both services' writes committed.
+        assert_eq!(manager.lookup("x", "s1", None).await.unwrap(), Value::Number { val: 1 });
+        assert_eq!(manager.lookup("w", "s2", None).await.unwrap(), Value::Number { val: 15 });
+        // Locks released on both services.
+        assert!(matches!(manager.services.get("s1").unwrap().vars.get("x").unwrap().lock, crate::runtime::txn::VarLock::Unlocked));
+        assert!(matches!(manager.services.get("s2").unwrap().vars.get("w").unwrap().lock, crate::runtime::txn::VarLock::Unlocked));
     }
 }
