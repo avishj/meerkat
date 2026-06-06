@@ -26,6 +26,13 @@ pub struct Manager {
     pub network: Option<NetworkActor>,
     /// Pending reply channels keyed by request_id
     pub pending_replies: HashMap<u64, oneshot::Sender<MeerkatMessage>>,
+    /// (Probabilistically) unique identifier of this node, used in transaction
+    /// ids so ids minted on different nodes never collide.
+    pub node_id: u64,
+    /// Distributed transactions this node is participating in: actions composed
+    /// by a remote originator, executed under a shared id and held (locks +
+    /// buffered writes) until a Commit or Abort arrives.
+    pub pending_txns: HashMap<TxnId, Transaction>,
 }
 
 impl Manager {
@@ -35,6 +42,8 @@ impl Manager {
             remote_services: HashMap::new(),
             network: None,
             pending_replies: HashMap::new(),
+            node_id: Self::random_node_id(),
+            pending_txns: HashMap::new(),
         }
     }
 
@@ -245,6 +254,8 @@ impl Manager {
                         MeerkatMessage::LookupResponse { request_id, .. } => Some(*request_id),
                         MeerkatMessage::LookupError { request_id, .. } => Some(*request_id),
                         MeerkatMessage::ActionResponse { request_id, .. } => Some(*request_id),
+                        MeerkatMessage::CommitResponse { request_id, .. } => Some(*request_id),
+                        MeerkatMessage::AbortResponse { request_id, .. } => Some(*request_id),
                         _ => None,
                     };
                     if let Some(id) = rid {
@@ -336,6 +347,22 @@ impl Manager {
         }
     }
 
+    /// Generate a probabilistically-unique node id with no extra dependency.
+    /// RandomState is OS-seeded on native targets; combining it with the current
+    /// time gives a value that is distinct across nodes with high probability.
+    fn random_node_id() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut h = RandomState::new().build_hasher();
+        h.write_u128(nanos);
+        h.finish()
+    }
+
     /// Get the local machine's outbound IP address (non-loopback)
     pub fn get_public_ip() -> String {
         use std::net::UdpSocket;
@@ -378,7 +405,7 @@ impl Manager {
         }
     }
 
-    pub async fn remote_action(&mut self, service: &str, stmts: Vec<ActionStmt>, env: Vec<(String, Value)>) -> Result<(), EvalError> {
+    pub async fn remote_action(&mut self, service: &str, stmts: Vec<ActionStmt>, env: Vec<(String, Value)>, txn: Option<&mut Transaction>) -> Result<(), EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -386,22 +413,32 @@ impl Manager {
         let request_id = NEXT_ACTION_ID.fetch_add(1, Ordering::SeqCst);
         let reply_to = self.local_reply_addr().await;
 
+        // When part of a transaction, ship its id so the remote node executes
+        // under the shared transaction and holds (does not commit) until our
+        // commit/abort. Standalone (no txn) keeps the old commit-immediately path.
+        let shared_tid = txn.as_ref().map(|t| t.id.clone());
+
         let msg = MeerkatMessage::ActionRequest {
             request_id,
             service: service.to_string(),
             stmts,
             env,
             reply_to,
+            txn_id: shared_tid,
         };
 
         let reply = self.send_and_await_reply(
-            addr, msg, request_id,
+            addr.clone(), msg, request_id,
             format!("Timeout waiting for remote action on service '{}'", service),
         ).await?;
 
         match reply {
             MeerkatMessage::ActionResponse { success, error, .. } => {
                 if success {
+                    // Record this node as a participant so we can commit/abort it.
+                    if let Some(t) = txn {
+                        t.participants.insert(addr);
+                    }
                     Ok(())
                 } else {
                     Err(EvalError::NetworkError(
@@ -513,7 +550,7 @@ impl Manager {
     ) -> Result<(), EvalError> {
         // The transaction owns all its state and is passed down through
         // execution; nothing transaction-specific lives on the Manager.
-        let mut txn = Transaction::new(TxnId::new());
+        let mut txn = Transaction::new(TxnId::new(self.node_id));
 
         // Execute statements; read/write locks are acquired lazily inside
         // lookup/assign as variables are accessed
@@ -527,42 +564,157 @@ impl Manager {
             }
         }
 
-        // Commit — apply the buffered writes to the service, record the writing
-        // transaction, then propagate to dependent defs. On execution error
-        // nothing is applied, so the transaction leaves no partial writes.
+        // Commit locally — apply buffered writes and propagate. On execution
+        // error nothing is applied, so a failed transaction leaves no partial
+        // writes. Then coordinate participants (two-phase: they already executed
+        // and are holding, so this is the commit/abort decision).
         let mut commit_error: Option<EvalError> = None;
         if exec_error.is_none() {
-            let writes: Vec<((ServiceId, String), Value)> = txn.written.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            let txn_id = txn.id.clone();
-            for ((sid, var), value) in &writes {
-                if let Some(service) = self.service_by_id_mut(sid) {
-                    if let Some(var_state) = service.vars.get_mut(var) {
-                        var_state.value = value.clone();
-                        var_state.latest_write_txn = Some(txn_id.clone());
-                    }
+            commit_error = self.apply_committed_writes(&txn).await.err();
+        }
+
+        if exec_error.is_none() && commit_error.is_none() {
+            // Tell every participant to commit its buffered writes.
+            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                if let Err(e) = self.send_commit(addr, &txn.id).await {
+                    commit_error = Some(e);
                 }
             }
-            // Propagate after all writes are applied so defs see a consistent
-            // state. Propagation is per owning service, resolved from its id.
-            for ((sid, var), _) in &writes {
-                if let Some(name) = self.name_for_id(sid) {
-                    if let Err(e) = self.propagate(&name, var).await {
-                        commit_error = Some(e);
-                        break;
-                    }
-                }
+        } else {
+            // Roll back: tell every participant to abort and discard its writes.
+            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                self.send_abort(addr, &txn.id).await;
             }
         }
 
-        // Release all locks (always, even on error)
+        // Release all locks held locally (always, even on error)
         self.release_locks(&txn.locked, &txn.id);
 
         match exec_error.or(commit_error) {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Apply a transaction's buffered writes to the owning services, record the
+    /// writing transaction, and propagate to dependent defs. Shared by local
+    /// commit and by a participant committing on a remote Commit message.
+    async fn apply_committed_writes(&mut self, txn: &Transaction) -> Result<(), EvalError> {
+        let writes: Vec<((ServiceId, String), Value)> = txn.written.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let txn_id = txn.id.clone();
+        for ((sid, var), value) in &writes {
+            if let Some(service) = self.service_by_id_mut(sid) {
+                if let Some(var_state) = service.vars.get_mut(var) {
+                    var_state.value = value.clone();
+                    var_state.latest_write_txn = Some(txn_id.clone());
+                }
+            }
+        }
+        // Propagate after all writes are applied so defs see a consistent state.
+        for ((sid, var), _) in &writes {
+            if let Some(name) = self.name_for_id(sid) {
+                self.propagate(&name, var).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Participant side: execute a composed action under a shared transaction id
+    /// received from the originator, then hold the transaction (locks + buffered
+    /// writes) in `pending_txns` until a Commit or Abort arrives. Does not commit.
+    pub async fn execute_action_participant(
+        &mut self,
+        service_name: &str,
+        stmts: &[ActionStmt],
+        initial_env: &[(String, Value)],
+        tid: TxnId,
+    ) -> Result<(), EvalError> {
+        let mut txn = Transaction::new(tid.clone());
+        let mut env: Vec<(String, Value)> = initial_env.to_vec();
+        let mut exec_error: Option<EvalError> = None;
+        for stmt in stmts {
+            match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
+                Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
+                Ok(_) => {}
+                Err(e) => { exec_error = Some(e); break; }
+            }
+        }
+        if let Some(e) = exec_error {
+            // Execution failed: release any locks acquired; nothing to hold.
+            self.release_locks(&txn.locked, &txn.id);
+            return Err(e);
+        }
+        // Prepared: hold locks and buffered writes until commit/abort.
+        self.pending_txns.insert(tid, txn);
+        Ok(())
+    }
+
+    /// Participant side: apply and release a held transaction on Commit.
+    pub async fn commit_participant(&mut self, tid: &TxnId) -> Result<(), EvalError> {
+        if let Some(txn) = self.pending_txns.remove(tid) {
+            let res = self.apply_committed_writes(&txn).await;
+            self.release_locks(&txn.locked, &txn.id);
+            // Forward the commit down the chain to any sub-participants this node
+            // composed (transitive composition: s1 -> s2 -> s3 ...).
+            let mut forward_err = res.err();
+            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                if let Err(e) = self.send_commit(addr, tid).await {
+                    forward_err = Some(e);
+                }
+            }
+            match forward_err { Some(e) => Err(e), None => Ok(()) }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Participant side: discard and release a held transaction on Abort, and
+    /// forward the abort down the chain to any sub-participants.
+    pub async fn abort_participant(&mut self, tid: &TxnId) {
+        if let Some(txn) = self.pending_txns.remove(tid) {
+            self.release_locks(&txn.locked, &txn.id);
+            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                self.send_abort(addr, tid).await;
+            }
+        }
+    }
+
+    /// Originator side: ask a participant to commit, awaiting its acknowledgement.
+    async fn send_commit(&mut self, addr: Address, tid: &TxnId) -> Result<(), EvalError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_COMMIT_ID: AtomicU64 = AtomicU64::new(1);
+        let request_id = NEXT_COMMIT_ID.fetch_add(1, Ordering::SeqCst);
+        let reply_to = self.local_reply_addr().await;
+        let msg = MeerkatMessage::Commit { request_id, txn_id: tid.clone(), reply_to };
+        let reply = self.send_and_await_reply(
+            addr, msg, request_id,
+            "Timeout waiting for commit acknowledgement".to_string(),
+        ).await?;
+        match reply {
+            MeerkatMessage::CommitResponse { success, error, .. } => {
+                if success { Ok(()) }
+                else { Err(EvalError::NetworkError(error.unwrap_or_else(|| "Participant commit failed".to_string()))) }
+            }
+            _ => Err(EvalError::NetworkError("Unexpected reply to commit".to_string())),
+        }
+    }
+
+    /// Originator side: tell a participant to abort, awaiting acknowledgement
+    /// so its locks are released before we return (and the process may exit).
+    async fn send_abort(&mut self, addr: Address, tid: &TxnId) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ABORT_ID: AtomicU64 = AtomicU64::new(1);
+        let request_id = NEXT_ABORT_ID.fetch_add(1, Ordering::SeqCst);
+        let reply_to = self.local_reply_addr().await;
+        let msg = MeerkatMessage::Abort { request_id, txn_id: tid.clone(), reply_to };
+        // Best-effort: if the ack times out we still proceed (locks will be
+        // reclaimed by the participant when it next reconciles).
+        let _ = self.send_and_await_reply(
+            addr, msg, request_id,
+            "Timeout waiting for abort acknowledgement".to_string(),
+        ).await;
     }
 
     pub async fn execute_action(&mut self, service_name: &str, stmts: &[ActionStmt]) -> Result<(), EvalError> {

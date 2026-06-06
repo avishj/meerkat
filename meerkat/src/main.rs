@@ -151,8 +151,13 @@ async fn run_server(prog: Vec<Stmt>, remote_url_map: std::collections::HashMap<S
                                 }).await;
                             }
                         }
-                        MeerkatMessage::ActionRequest { request_id, service, stmts, env: action_env, reply_to } => {
-                            let result = manager.execute_action_with_env(&service, &stmts, &action_env).await;
+                        MeerkatMessage::ActionRequest { request_id, service, stmts, env: action_env, reply_to, txn_id } => {
+                            // Part of a distributed transaction: execute under the
+                            // shared id and hold. Standalone: commit immediately.
+                            let result = match txn_id {
+                                Some(tid) => manager.execute_action_participant(&service, &stmts, &action_env, tid).await,
+                                None => manager.execute_action_with_env(&service, &stmts, &action_env).await,
+                            };
                             let response = MeerkatMessage::ActionResponse {
                                 request_id,
                                 success: result.is_ok(),
@@ -162,6 +167,29 @@ async fn run_server(prog: Vec<Stmt>, remote_url_map: std::collections::HashMap<S
                                 net.handle_command(NetworkCommand::SendMessage {
                                     addr: Address::new(&reply_to),
                                     msg: response,
+                                }).await;
+                            }
+                        }
+                        MeerkatMessage::Commit { request_id, txn_id, reply_to } => {
+                            let result = manager.commit_participant(&txn_id).await;
+                            let response = MeerkatMessage::CommitResponse {
+                                request_id,
+                                success: result.is_ok(),
+                                error: result.err().map(|e| e.to_string()),
+                            };
+                            if let Some(net) = manager.network.as_mut() {
+                                net.handle_command(NetworkCommand::SendMessage {
+                                    addr: Address::new(&reply_to),
+                                    msg: response,
+                                }).await;
+                            }
+                        }
+                        MeerkatMessage::Abort { request_id, txn_id, reply_to } => {
+                            manager.abort_participant(&txn_id).await;
+                            if let Some(net) = manager.network.as_mut() {
+                                net.handle_command(NetworkCommand::SendMessage {
+                                    addr: Address::new(&reply_to),
+                                    msg: MeerkatMessage::AbortResponse { request_id },
                                 }).await;
                             }
                         }

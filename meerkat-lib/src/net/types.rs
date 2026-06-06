@@ -8,7 +8,7 @@ pub struct MessageId(pub u64);
 /// Examples: 
 /// - Server: "/ip4/203.0.113.10/tcp/9000/p2p/12D3..."
 /// - Client: "/ip4/203.0.113.10/tcp/9000/p2p/server-id/ws/p2p/client-id"
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Address(pub String);
 
 impl Address {
@@ -90,6 +90,10 @@ pub enum MeerkatMessage {
         stmts: Vec<crate::ast::ActionStmt>,
         env: Vec<(String, crate::ast::Value)>,
         reply_to: String,
+        /// When Some, the action joins the originator's distributed transaction:
+        /// execute under this shared id and hold (do not commit) until a later
+        /// Commit/Abort. When None, execute standalone and commit immediately.
+        txn_id: Option<crate::runtime::txn::TxnId>,
     },
 
     /// Response to ActionRequest
@@ -97,6 +101,36 @@ pub enum MeerkatMessage {
         request_id: u64,
         success: bool,
         error: Option<String>,
+    },
+
+    /// Tell a participant node to commit a distributed transaction: apply the
+    /// writes it buffered for `txn_id` and release the locks it holds.
+    Commit {
+        request_id: u64,
+        txn_id: crate::runtime::txn::TxnId,
+        reply_to: String,
+    },
+
+    /// Acknowledgement that a Commit was applied (or failed) on a participant.
+    CommitResponse {
+        request_id: u64,
+        success: bool,
+        error: Option<String>,
+    },
+
+    /// Tell a participant node to abort a distributed transaction: discard the
+    /// writes it buffered for `txn_id` and release the locks it holds.
+    /// Acknowledged so the originator knows the participant's locks are freed
+    /// before it returns (and exits).
+    Abort {
+        request_id: u64,
+        txn_id: crate::runtime::txn::TxnId,
+        reply_to: String,
+    },
+
+    /// Acknowledgement that an Abort was processed on a participant.
+    AbortResponse {
+        request_id: u64,
     },
 }
 

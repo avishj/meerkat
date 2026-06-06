@@ -32,10 +32,10 @@ pub async fn execute(
             match val {
                 Value::ActionClosure { stmts, env: closure_env, service_name: action_svc } => {
                     if manager.remote_services.contains_key(&action_svc) {
-                        // Remote actions don't yet participate in the local
-                        // transaction; distributed lock coordination is future work.
-                        manager.remote_action(&action_svc, stmts, closure_env).await?;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        // Ship the action to its owning node under the shared
+                        // transaction (Option B). The remote node executes and
+                        // holds; our commit/abort decides its fate.
+                        manager.remote_action(&action_svc, stmts, closure_env, txn.as_deref_mut()).await?;
                     } else {
                         let mut exec_env = closure_env.clone();
                         for s in &stmts {

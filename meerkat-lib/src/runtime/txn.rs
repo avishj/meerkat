@@ -4,34 +4,47 @@
 //! and lock.rs provide the full actor-based infrastructure for future use.
 
 use std::collections::{HashMap, HashSet};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
+use serde::{Serialize, Deserialize};
 use crate::runtime::ast::Value;
-use crate::net::ServiceId;
+use crate::net::{ServiceId, Address};
 
 /// A globally unique transaction identifier.
-/// Older timestamp = higher priority (for future wait-die implementation).
-/// Higher iteration = higher priority among retries of the same transaction.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// Per the Historiographer design a tid is a (unique node identifier,
+/// timestamp) pair. The timestamp is nanoseconds since the Unix epoch; the
+/// node_id makes ids from different nodes distinct and serves as the age
+/// tiebreaker. Serializable so it can travel in cross-node messages.
+///
+/// Age (for future wait-die): older = smaller timestamp, with node_id as
+/// tiebreaker. Higher iteration = higher priority among retries of the same
+/// transaction.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TxnId {
-    /// Wall-clock creation time, used for priority ordering.
-    pub timestamp: SystemTime,
+    /// Wall-clock creation time as nanoseconds since the Unix epoch.
+    pub timestamp: u128,
+    /// (Probabilistically) unique identifier of the originating node.
+    pub node_id: u64,
     /// Incremented on retry so retried transactions gain priority.
     pub iteration: u32,
 }
 
 impl TxnId {
-    pub fn new() -> Self {
-        TxnId {
-            timestamp: SystemTime::now(),
-            iteration: 0,
-        }
+    /// Create a new transaction id originating from the given node.
+    pub fn new(node_id: u64) -> Self {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        TxnId { timestamp, node_id, iteration: 0 }
     }
 
-    /// Return a new TxnId with the same timestamp but higher iteration,
+    /// Return a new TxnId with the same timestamp/node but higher iteration,
     /// for use when retrying an aborted transaction.
     pub fn retry(&self) -> Self {
         TxnId {
             timestamp: self.timestamp,
+            node_id: self.node_id,
             iteration: self.iteration + 1,
         }
     }
@@ -45,10 +58,12 @@ impl PartialOrd for TxnId {
 
 impl Ord for TxnId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Older timestamp = smaller = higher priority
-        // Higher iteration = higher priority among retries
+        // Age ordering: older timestamp = smaller = higher priority, with
+        // node_id as the tiebreaker. Higher iteration = higher priority among
+        // retries of the same transaction.
         self.timestamp
             .cmp(&other.timestamp)
+            .then(self.node_id.cmp(&other.node_id))
             .then(other.iteration.cmp(&self.iteration))
     }
 }
@@ -175,6 +190,9 @@ pub struct Transaction {
     /// buffered and applied only on successful commit (so a failed transaction
     /// leaves no partial writes).
     pub written: HashMap<(ServiceId, String), Value>,
+    /// Remote nodes that joined this transaction (executed a composed action
+    /// under this id and are holding locks/buffered writes until commit/abort).
+    pub participants: HashSet<Address>,
 }
 
 impl Transaction {
@@ -184,6 +202,7 @@ impl Transaction {
             locked: HashSet::new(),
             read_cache: HashMap::new(),
             written: HashMap::new(),
+            participants: HashSet::new(),
         }
     }
 }
