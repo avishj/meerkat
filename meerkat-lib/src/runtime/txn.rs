@@ -3,9 +3,9 @@
 //! Simplified implementation for issue #19. The existing transaction.rs
 //! and lock.rs provide the full actor-based infrastructure for future use.
 
+use crate::runtime::ast::Value;
 use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
-use crate::runtime::ast::Value;
 
 /// A globally unique transaction identifier.
 /// Older timestamp = higher priority (for future wait-die implementation).
