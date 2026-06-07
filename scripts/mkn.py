@@ -167,6 +167,8 @@ class Manifest:
                     raise ValueError(f"Client node '{alias}' cannot specify a port number")
                 if node_def["port"] is not None and not isinstance(node_def["port"], int):
                     raise ValueError(f"Server node '{alias}' 'port' must be an integer")
+                if node_def["port"] <= 0 or node_def["port"] > 65535:
+                    raise ValueError(f"Server node '{alias}' 'port' must be between 1 and 65535")
                     
             # gateway check
             if "gateway" in node_def:
