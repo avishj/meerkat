@@ -80,13 +80,20 @@ impl Manager {
         let dep = calc_dep_srv(&decls);
 
         let id = self.service_identity(&name);
-        let mut service = Service {
-            id,
-            name: name.clone(),
-            vars: HashMap::new(),
-            defs: HashMap::new(),
-            dep,
-        };
+        // Register the service (with its real ServiceId) before evaluating any
+        // declarations, so action closures built during initialization are
+        // stamped with the correct ServiceId instead of id_for_service's
+        // bare-name fallback.
+        self.services.insert(
+            name.clone(),
+            Service {
+                id,
+                name: name.clone(),
+                vars: HashMap::new(),
+                defs: HashMap::new(),
+                dep,
+            },
+        );
 
         let mut env: Vec<(String, Value)> = vec![];
         let svc_name = name.clone();
@@ -105,7 +112,9 @@ impl Manager {
                     )
                     .await?;
                     env.push((name.clone(), value.clone()));
-                    service.vars.insert(name, VarState::new(value));
+                    if let Some(service) = self.services.get_mut(&svc_name) {
+                        service.vars.insert(name, VarState::new(value));
+                    }
                 }
                 Decl::DefDecl { name, val, .. } => {
                     let value = eval(
@@ -119,8 +128,10 @@ impl Manager {
                     )
                     .await?;
                     env.push((name.clone(), value.clone()));
-                    service.vars.insert(name.clone(), VarState::new(value));
-                    service.defs.insert(name, val); // store original expr
+                    if let Some(service) = self.services.get_mut(&svc_name) {
+                        service.vars.insert(name.clone(), VarState::new(value));
+                        service.defs.insert(name, val); // store original expr
+                    }
                 }
                 Decl::TableDecl { .. } => {
                     return Err(EvalError::NotImplemented);
@@ -128,7 +139,6 @@ impl Manager {
             }
         }
 
-        self.services.insert(name.clone(), service);
         Ok(())
     }
 
