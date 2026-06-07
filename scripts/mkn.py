@@ -437,7 +437,8 @@ class NetworkOrchestrator:
             imports_resolved = True
             if node.gateway:
                 dep_node = self.nodes_by_alias[node.gateway]
-                if not dep_node.is_online:
+                # Prevent edge case where online, but peer id not assigned
+                if (not dep_node.is_online) or (not dep_node.peer_id):
                     imports_resolved = False
                     
             if imports_resolved:
