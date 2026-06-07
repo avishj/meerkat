@@ -222,6 +222,25 @@ def run_client_timeout_test():
     
     return True
 
+def run_missing_service_test():
+    """Runs integration test to verify that importing a missing service fails cleanly."""
+    print("\nRunning Test 5: missing service dependency error...")
+    code, output = run_cmd([
+        sys.executable, "scripts/mkn.py", "meerkat/tests/mkn/test_mkn_missing_service.json"
+    ])
+    print(output)
+    if code == 0:
+        print("FAIL: Missing service test exited with 0, expected error exit code")
+        return False
+    
+    expected_err = "imports missing service 'non_existent_svc' from online node 'basic_server'"
+    if expected_err not in output:
+        print(f"FAIL: Expected error message '{expected_err}' in output")
+        return False
+        
+    print("PASS: Missing service test (failed cleanly with correct error message)")
+    return True
+
 def main():
     """Main entry point to execute the integration test suite and exit with appropriate code."""
     success = True
@@ -229,6 +248,7 @@ def main():
     success &= run_namespace_split_test()
     success &= run_validation_failure_test()
     success &= run_client_timeout_test()
+    success &= run_missing_service_test()
     
     if success:
         print("\nALL INTEGRATION TESTS PASSED SUCCESSFULLY! ✓")

@@ -462,8 +462,7 @@ class NetworkOrchestrator:
                         imports_resolved = False
                         break
                     if svc_name not in dep_node.local_services and svc_name not in dep_node.relayed_services:
-                        imports_resolved = False
-                        break
+                        raise RuntimeError(f"Node '{node.alias}' imports missing service '{svc_name}' from online node '{dep_alias}'")
                         
             if imports_resolved:
                 self.spawn_node(node)
