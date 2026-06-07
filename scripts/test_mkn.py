@@ -51,10 +51,10 @@ def run_basic_test():
     return True
 
 def run_namespace_split_test():
-    """Runs integration test 2 (mkn_namespace_split) to verify three-namespace tracking and gateway routing."""
+    """Runs integration test 2 (mkn_namespace_split) to verify three-namespace tracking and relay routing."""
     print("\nRunning Test 2: mkn_namespace_split...")
     code, output = run_cmd([
-        sys.executable, "scripts/mkn.py", "meerkat/tests/mkn/test_mkn_gateway.json", "--dump-state"
+        sys.executable, "scripts/mkn.py", "meerkat/tests/mkn/test_mkn_relay.json", "--dump-state"
     ])
     
     print(output)
@@ -77,22 +77,22 @@ def run_namespace_split_test():
         print("FAIL: Failed to parse state dump JSON:", e)
         return False
         
-    gateway = state.get("gateway_node")
+    relay = state.get("relay_node")
     client = state.get("relayed_client")
     
-    if not gateway or not client:
-        print("FAIL: gateway_node or relayed_client missing from state dump")
+    if not relay or not client:
+        print("FAIL: relay_node or relayed_client missing from state dump")
         return False
         
-    # Check gateway local_services
-    if "gateway_svc" not in gateway.get("local_services", {}):
-        print("FAIL: gateway_svc missing from gateway local_services")
+    # Check relay local_services
+    if "relay_svc" not in relay.get("local_services", {}):
+        print("FAIL: relay_svc missing from relay local_services")
         return False
         
-    # Check gateway relayed_services (this verifies the three namespaces and gateway tracking!)
-    relayed_services = gateway.get("relayed_services", {})
+    # Check relay relayed_services (this verifies the three namespaces and relay tracking!)
+    relayed_services = relay.get("relayed_services", {})
     if "client_svc" not in relayed_services:
-        print("FAIL: client_svc missing from gateway relayed_services (gateway proxy tracking failed)")
+        print("FAIL: client_svc missing from relay relayed_services (relay proxy tracking failed)")
         return False
         
     # Check service properties
@@ -101,13 +101,13 @@ def run_namespace_split_test():
         print("FAIL: client_svc is_relayed is false, expected true")
         return False
         
-    if client_svc.get("gateway_peer_id") != gateway.get("peer_id"):
-        print(f"FAIL: client_svc gateway_peer_id ({client_svc.get('gateway_peer_id')}) does not match gateway's peer_id ({gateway.get('peer_id')})")
+    if client_svc.get("relay_peer_id") != relay.get("peer_id"):
+        print(f"FAIL: client_svc relay_peer_id ({client_svc.get('relay_peer_id')}) does not match relay's peer_id ({relay.get('peer_id')})")
         return False
         
     # Check client remote_services
-    if "gateway_svc" not in client.get("remote_services", {}):
-        print("FAIL: gateway_svc missing from client remote_services")
+    if "relay_svc" not in client.get("remote_services", {}):
+        print("FAIL: relay_svc missing from client remote_services")
         return False
         
     print("PASS: mkn_namespace_split (all 3 namespaces verified)")
@@ -128,8 +128,8 @@ def run_validation_failure_test():
         ("Missing file or cmd", "test_mkn_missing_file_or_cmd.json", "must specify either 'file' or 'cmd'"),
         ("Invalid cmd", "test_mkn_invalid_cmd.json", "'cmd' must be a list of strings"),
         ("Invalid port type", "test_mkn_invalid_port_type.json", "'port' must be an integer"),
-        ("Server with gateway", "test_mkn_server_gateway.json", "cannot specify a gateway"),
-        ("Invalid gateway reference", "test_mkn_invalid_gateway.json", "which does not exist in the manifest"),
+        ("Server with relay", "test_mkn_server_relay.json", "cannot specify a relay"),
+        ("Invalid relay reference", "test_mkn_invalid_relay.json", "which does not exist in the manifest"),
         ("Invalid imports format", "test_mkn_invalid_imports_format.json", "must use 'alias.service_name' dot-notation"),
         ("Invalid imports reference", "test_mkn_invalid_imports_reference.json", "imports from node 'missing' which does not exist"),
         ("Circular dependency", "test_mkn_circular_dependency.json", "Circular dependency detected in manifest"),

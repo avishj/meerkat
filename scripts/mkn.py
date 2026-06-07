@@ -38,18 +38,18 @@ class Service:
         self.url = url
         self.host_peer_id = host_peer_id
         
-        # Determine if this service is behind a gateway proxy
+        # Determine if this service is behind a relay proxy
         self.is_relayed = "/p2p-circuit/" in url
-        self.gateway_peer_id = self._extract_gateway() if self.is_relayed else None
+        self.relay_peer_id = self._extract_relay() if self.is_relayed else None
 
-    def _extract_gateway(self):
+    def _extract_relay(self):
         """
         Parses the multiaddr to find the relay hop. 
-        Example URL: /ip4/127.0.0.1/tcp/9001/p2p/QmGateway123/p2p-circuit/p2p/QmClient456/svc_name
-        We extract 'QmGateway123' as the gateway_peer_id.
+        Example URL: /ip4/127.0.0.1/tcp/9001/p2p/QmRelay123/p2p-circuit/p2p/QmClient456/svc_name
+        We extract 'QmRelay123' as the relay_peer_id.
         
         Returns:
-            The gateway PeerID string if found, otherwise None.
+            The relay PeerID string if found, otherwise None.
         """
         match = re.search(r'/p2p/([^/]+)/p2p-circuit/', self.url)
         if match:
@@ -70,7 +70,7 @@ class Node:
         self.source_file = manifest_def.get("file")
         self.cmd = manifest_def.get("cmd")
         self.port = manifest_def.get("port")
-        self.gateway = manifest_def.get("gateway")
+        self.relay = manifest_def.get("relay")
         self.timeout = manifest_def.get("timeout", 0)
         self.imports = manifest_def.get("imports", [])
         self.peer_id = None
@@ -170,13 +170,13 @@ class Manifest:
                 if node_def["port"] <= 0 or node_def["port"] > 65535:
                     raise ValueError(f"Server node '{alias}' 'port' must be between 1 and 65535")
                     
-            # gateway check
-            if "gateway" in node_def:
+            # relay check
+            if "relay" in node_def:
                 if node_type == "server":
-                    raise ValueError(f"Server node '{alias}' cannot specify a gateway")
-                gateway = node_def["gateway"]
-                if not isinstance(gateway, str) or not gateway:
-                    raise ValueError(f"Node '{alias}' 'gateway' must be a non-empty string")
+                    raise ValueError(f"Server node '{alias}' cannot specify a relay")
+                relay = node_def["relay"]
+                if not isinstance(relay, str) or not relay:
+                    raise ValueError(f"Node '{alias}' 'relay' must be a non-empty string")
                     
             # imports check
             imports = node_def.get("imports", [])
@@ -194,11 +194,11 @@ class Manifest:
         for node_def in self.nodes:
             alias = node_def["alias"]
             
-            # gateway check
-            if "gateway" in node_def:
-                gateway = node_def["gateway"]
-                if gateway not in self.nodes_by_alias:
-                    raise ValueError(f"Node '{alias}' specifies gateway '{gateway}' which does not exist in the manifest")
+            # relay check
+            if "relay" in node_def:
+                relay = node_def["relay"]
+                if relay not in self.nodes_by_alias:
+                    raise ValueError(f"Node '{alias}' specifies relay '{relay}' which does not exist in the manifest")
                     
             # imports check
             for imp in node_def.get("imports", []):
@@ -208,7 +208,7 @@ class Manifest:
                     
         # 3. Cycle checks
         if self.check_cycles():
-            raise ValueError("Circular dependency detected in manifest imports/gateways")
+            raise ValueError("Circular dependency detected in manifest imports/relays")
 
     def check_cycles(self) -> bool:
         """
@@ -219,8 +219,8 @@ class Manifest:
         """
         adj = {alias: [] for alias in self.nodes_by_alias}
         for alias, node_def in self.nodes_by_alias.items():
-            if "gateway" in node_def:
-                adj[alias].append(node_def["gateway"])
+            if "relay" in node_def:
+                adj[alias].append(node_def["relay"])
             for imp in node_def.get("imports", []):
                 dep_alias = imp.split('.')[0]
                 if dep_alias in adj:
@@ -304,8 +304,8 @@ class NetworkOrchestrator:
         # where N is the number of nodes and M is the maximum imports per node.
         self.dependency_aliases = set()
         for node_def in manifest.nodes_by_alias.values():
-            if "gateway" in node_def and node_def["gateway"]:
-                self.dependency_aliases.add(node_def["gateway"])
+            if "relay" in node_def and node_def["relay"]:
+                self.dependency_aliases.add(node_def["relay"])
             for imp in node_def.get("imports", []):
                 self.dependency_aliases.add(imp.split('.')[0])
 
@@ -351,9 +351,9 @@ class NetworkOrchestrator:
             
         if node.cmd:
             cmd = list(node.cmd)
-            if node.gateway:
-                gateway_node = self.nodes_by_alias[node.gateway]
-                cmd.extend(["--gateway-peer", gateway_node.peer_id])
+            if node.relay:
+                relay_node = self.nodes_by_alias[node.relay]
+                cmd.extend(["--relay", relay_node.peer_id])
             cmd.extend(import_flags)
         else:
             cmd = ["cargo", "run", "-p", "meerkat", "--", "--local"]
@@ -417,16 +417,16 @@ class NetworkOrchestrator:
             node.local_services[svc_name] = svc
             
             if svc.is_relayed:
-                gateway_node = None
+                relay_node = None
                 for n in self.nodes_by_alias.values():
-                    if n.peer_id == svc.gateway_peer_id:
-                        gateway_node = n
+                    if n.peer_id == svc.relay_peer_id:
+                        relay_node = n
                         break
-                if gateway_node:
-                    gateway_node.relayed_services[svc_name] = svc
-                    print(f"[{node.alias}] Service '{svc_name}' (relayed via gateway '{gateway_node.alias}') is registered.")
+                if relay_node:
+                    relay_node.relayed_services[svc_name] = svc
+                    print(f"[{node.alias}] Service '{svc_name}' (relayed via relay '{relay_node.alias}') is registered.")
                 else:
-                    print(f"[{node.alias}] Warning: Service '{svc_name}' is relayed via gateway peer ID {svc.gateway_peer_id}, but gateway not found!")
+                    print(f"[{node.alias}] Warning: Service '{svc_name}' is relayed via relay peer ID {svc.relay_peer_id}, but relay not found!")
             else:
                 print(f"[{node.alias}] Service '{svc_name}' is online at {url}")
 
@@ -438,15 +438,15 @@ class NetworkOrchestrator:
     def spawn_resolved_nodes(self):
         """
         Scans all pending nodes and spawns them if all of their imports and
-        gateway dependencies are fully initialized and online.
+        relay dependencies are fully initialized and online.
         """
         for node in self.nodes_by_alias.values():
             if node.is_started:
                 continue
                 
             imports_resolved = True
-            if node.gateway:
-                dep_node = self.nodes_by_alias[node.gateway]
+            if node.relay:
+                dep_node = self.nodes_by_alias[node.relay]
                 # Prevent edge case where online, but peer id not assigned
                 if (not dep_node.is_online) or (not dep_node.peer_id):
                     imports_resolved = False
@@ -482,7 +482,7 @@ class NetworkOrchestrator:
     def _is_node_dependency(self, node):
         """
         Determines if any other node in the network depends on the given node
-        either as a gateway or via service imports.
+        either as a relay or via service imports.
         
         This check uses a precalculated set of dependency aliases computed
         during initialization. This optimizes the query from a nested graph search
@@ -604,9 +604,9 @@ class NetworkOrchestrator:
             state[alias] = {
                 "alias": node.alias,
                 "peer_id": node.peer_id,
-                "local_services": {name: {"name": svc.name, "url": svc.url, "host_peer_id": svc.host_peer_id, "is_relayed": svc.is_relayed, "gateway_peer_id": svc.gateway_peer_id} for name, svc in node.local_services.items()},
-                "remote_services": {name: {"name": svc.name, "url": svc.url, "host_peer_id": svc.host_peer_id, "is_relayed": svc.is_relayed, "gateway_peer_id": svc.gateway_peer_id} for name, svc in node.remote_services.items()},
-                "relayed_services": {name: {"name": svc.name, "url": svc.url, "host_peer_id": svc.host_peer_id, "is_relayed": svc.is_relayed, "gateway_peer_id": svc.gateway_peer_id} for name, svc in node.relayed_services.items()}
+                "local_services": {name: {"name": svc.name, "url": svc.url, "host_peer_id": svc.host_peer_id, "is_relayed": svc.is_relayed, "relay_peer_id": svc.relay_peer_id} for name, svc in node.local_services.items()},
+                "remote_services": {name: {"name": svc.name, "url": svc.url, "host_peer_id": svc.host_peer_id, "is_relayed": svc.is_relayed, "relay_peer_id": svc.relay_peer_id} for name, svc in node.remote_services.items()},
+                "relayed_services": {name: {"name": svc.name, "url": svc.url, "host_peer_id": svc.host_peer_id, "is_relayed": svc.is_relayed, "relay_peer_id": svc.relay_peer_id} for name, svc in node.relayed_services.items()}
             }
         print("--- STATE DUMP ---")
         print(json.dumps(state, indent=2))
@@ -673,7 +673,7 @@ Manifest file format (JSON):
         "alias": "client_node",
         "type": "client",
         "file": "meerkat/tests/net_orch3.mkt",
-        "gateway": "server_node",
+        "relay": "server_node",
         "imports": ["server_node.node1_a"]
       }
     ]

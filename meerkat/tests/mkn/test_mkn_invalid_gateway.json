@@ -1,6 +1,0 @@
-{
-  "settings": {},
-  "nodes": [
-    {"alias": "node1", "type": "client", "file": "test.mkt", "gateway": "missing_node"}
-  ]
-}

@@ -1,4 +1,4 @@
-import gateway_svc
+import relay_svc
 
 service client_svc {
     var y = 100;
