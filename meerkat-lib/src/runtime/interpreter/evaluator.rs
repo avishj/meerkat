@@ -223,7 +223,7 @@ pub async fn eval(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{BinOp, Expr, Value};
+    use crate::ast::{ActionStmt, BinOp, Expr, Value};
     use crate::runtime::Manager;
 
     #[tokio::test]
