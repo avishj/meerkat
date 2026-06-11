@@ -35,7 +35,6 @@ impl DependAnalysis {
                     tables.insert(name.clone());
                     dep_graph.insert(name.clone(), HashSet::new());
                 }
-                _ => {}
             }
         }
 
