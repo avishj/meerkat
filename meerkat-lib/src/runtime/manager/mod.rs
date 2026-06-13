@@ -147,6 +147,31 @@ impl Manager {
         removed
     }
 
+    /// (request_id, reply_to) for every currently parked request, so the owner
+    /// can periodically reassure waiting originators that they are still queued
+    /// (keepalive), keeping the wait from hitting the reply timeout.
+    pub fn parked_keepalive_targets(&self) -> Vec<(u64, String)> {
+        let mut out = Vec::new();
+        for waiters in self.wait_queue.values() {
+            for p in waiters {
+                let pair = match p {
+                    ParkedRequest::Action {
+                        request_id,
+                        reply_to,
+                        ..
+                    } => (*request_id, reply_to.clone()),
+                    ParkedRequest::Lookup {
+                        request_id,
+                        reply_to,
+                        ..
+                    } => (*request_id, reply_to.clone()),
+                };
+                out.push(pair);
+            }
+        }
+        out
+    }
+
     /// Record this node's canonical address once the network is listening, so
     /// service identities are stable and consistent with the advertised URL.
     pub fn set_local_address(&mut self, addr: String) {
@@ -455,6 +480,7 @@ impl Manager {
                         MeerkatMessage::ActionResponse { request_id, .. } => Some(*request_id),
                         MeerkatMessage::CommitResponse { request_id, .. } => Some(*request_id),
                         MeerkatMessage::AbortResponse { request_id, .. } => Some(*request_id),
+                        MeerkatMessage::WaitParked { request_id, .. } => Some(*request_id),
                         _ => None,
                     };
                     if let Some(id) = rid {
@@ -503,9 +529,25 @@ impl Manager {
             tokio::select! {
                 biased;
                 result = &mut rx => {
-                    return result.map_err(|_| {
-                        EvalError::NetworkError("Reply channel closed".to_string())
-                    });
+                    match result {
+                        // Owner parked our request (wait-die wait): it is alive
+                        // and still queued, so reset the timeout, re-register a
+                        // fresh reply channel, and keep waiting.
+                        Ok(MeerkatMessage::WaitParked { .. }) => {
+                            let (ntx, nrx) = oneshot::channel::<MeerkatMessage>();
+                            self.pending_replies.insert(request_id, ntx);
+                            rx = nrx;
+                            timeout
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + Duration::from_secs(15));
+                        }
+                        Ok(msg) => return Ok(msg),
+                        Err(_) => {
+                            return Err(EvalError::NetworkError(
+                                "Reply channel closed".to_string(),
+                            ))
+                        }
+                    }
                 }
                 _ = &mut timeout => {
                     self.pending_replies.remove(&request_id);
