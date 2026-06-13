@@ -480,7 +480,7 @@ impl Manager {
                         MeerkatMessage::ActionResponse { request_id, .. } => Some(*request_id),
                         MeerkatMessage::CommitResponse { request_id, .. } => Some(*request_id),
                         MeerkatMessage::AbortResponse { request_id, .. } => Some(*request_id),
-                        MeerkatMessage::WaitParked { request_id, .. } => Some(*request_id),
+                        MeerkatMessage::WaitParked { request_id } => Some(*request_id),
                         _ => None,
                     };
                     if let Some(id) = rid {
