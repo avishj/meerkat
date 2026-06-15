@@ -110,7 +110,9 @@ pub async fn run_repl(
             Ok(l) => l,
             Err(ReadlineError::Interrupted) => {
                 buffer.clear();
-                println!("Interrupt");
+                if is_tty {
+                    println!("Interrupt");
+                }
                 continuation = false;
                 continue;
             }
