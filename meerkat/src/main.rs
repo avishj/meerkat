@@ -4,9 +4,12 @@ use clap::Parser;
 use meerkat_lib::net::network_layer::NetworkLayer;
 use meerkat_lib::net::types::NodeType;
 use meerkat_lib::net::NetworkActor;
-use meerkat_lib::net::{Address, MeerkatMessage, NetworkCommand, NetworkEvent};
+use meerkat_lib::net::{Address, MeerkatMessage, NetworkCommand, NetworkEvent, ServiceId};
 use meerkat_lib::runtime::ast::Stmt;
+use meerkat_lib::runtime::interpreter::EvalError;
+use meerkat_lib::runtime::manager::ParkedRequest;
 use meerkat_lib::runtime::Manager;
+use std::collections::HashSet;
 use std::error::Error;
 
 #[derive(Parser, Debug)]
@@ -111,6 +114,117 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// Run a participant request (initial dispatch or a woken waiter) and either
+/// send its reply, or, if the requesting transaction is older than a current
+/// lock holder (wait-die), park it on the contended variable's queue to be
+/// re-run when that lock frees.
+async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
+    match parked {
+        ParkedRequest::Action {
+            request_id,
+            reply_to,
+            service,
+            stmts,
+            env,
+            tid,
+        } => {
+            match manager
+                .execute_action_participant(&service, &stmts, &env, tid.clone())
+                .await
+            {
+                Err(EvalError::WaitOn(svc, var)) => {
+                    manager.park_request(
+                        &svc,
+                        var,
+                        ParkedRequest::Action {
+                            request_id,
+                            reply_to,
+                            service,
+                            stmts,
+                            env,
+                            tid,
+                        },
+                    );
+                }
+                other => {
+                    let response = MeerkatMessage::ActionResponse {
+                        request_id,
+                        success: other.is_ok(),
+                        error: other.err().map(|e| e.to_string()),
+                    };
+                    if let Some(net) = manager.network.as_mut() {
+                        net.handle_command(NetworkCommand::SendMessage {
+                            addr: Address::new(&reply_to),
+                            msg: response,
+                        })
+                        .await;
+                    }
+                }
+            }
+        }
+        ParkedRequest::Lookup {
+            request_id,
+            reply_to,
+            service,
+            member,
+            tid,
+        } => {
+            match manager
+                .remote_read_participant(&service, &member, tid.clone())
+                .await
+            {
+                Err(EvalError::WaitOn(svc, var)) => {
+                    manager.park_request(
+                        &svc,
+                        var,
+                        ParkedRequest::Lookup {
+                            request_id,
+                            reply_to,
+                            service,
+                            member,
+                            tid,
+                        },
+                    );
+                }
+                Ok(val) => {
+                    let response = MeerkatMessage::LookupResponse {
+                        request_id,
+                        value: serde_json::to_string(&val).unwrap_or_default(),
+                    };
+                    if let Some(net) = manager.network.as_mut() {
+                        net.handle_command(NetworkCommand::SendMessage {
+                            addr: Address::new(&reply_to),
+                            msg: response,
+                        })
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    let response = MeerkatMessage::LookupError {
+                        request_id,
+                        error: e.to_string(),
+                    };
+                    if let Some(net) = manager.network.as_mut() {
+                        net.handle_command(NetworkCommand::SendMessage {
+                            addr: Address::new(&reply_to),
+                            msg: response,
+                        })
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// After a holder releases its locks on commit or abort, re-dispatch the parked
+/// requests waiting on the freed variables, oldest first.
+async fn wake_ready(manager: &mut Manager, freed: HashSet<(ServiceId, String)>) {
+    for parked in manager.take_ready_waiters(&freed) {
+        run_and_reply_or_park(manager, parked).await;
+    }
+}
+
 async fn run_server(
     prog: Vec<Stmt>,
     remote_url_map: std::collections::HashMap<String, String>,
@@ -177,10 +291,24 @@ async fn run_server(
 
     println!("Server running, press Ctrl+C to stop...");
 
+    let mut last_keepalive = tokio::time::Instant::now();
     loop {
-        if let Some(NetworkEvent::MessageReceived { peer: _, msg }) =
-            manager.network.as_mut().and_then(|n| n.try_recv_event())
-        {
+        // Periodically reassure parked waiters (wait-die wait) that they are
+        // still queued, so their reply timeout never fires while we hold them.
+        if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
+            for (request_id, reply_to) in manager.parked_keepalive_targets() {
+                if let Some(net) = manager.network.as_mut() {
+                    net.handle_command(NetworkCommand::SendMessage {
+                        addr: Address::new(&reply_to),
+                        msg: MeerkatMessage::WaitParked { request_id },
+                    })
+                    .await;
+                }
+            }
+            last_keepalive = tokio::time::Instant::now();
+        }
+        let event = manager.network.as_mut().and_then(|n| n.try_recv_event());
+        if let Some(NetworkEvent::MessageReceived { msg, .. }) = event {
             match msg {
                 MeerkatMessage::LookupRequest {
                     request_id,
@@ -188,35 +316,43 @@ async fn run_server(
                     member,
                     reply_to,
                     txn_id,
-                } => {
-                    // Transactional read: acquire and hold a read lock
-                    // under the shared id. Plain read otherwise.
-                    let result = match txn_id {
-                        Some(tid) => {
-                            manager
-                                .remote_read_participant(&service, &member, tid)
-                                .await
-                        }
-                        None => manager.lookup(&member, &service, None).await,
-                    };
-                    let response = match result {
-                        Ok(val) => MeerkatMessage::LookupResponse {
-                            request_id,
-                            value: serde_json::to_string(&val).unwrap_or_default(),
-                        },
-                        Err(e) => MeerkatMessage::LookupError {
-                            request_id,
-                            error: e.to_string(),
-                        },
-                    };
-                    if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
+                } => match txn_id {
+                    // Transactional read: park if older than a holder.
+                    Some(tid) => {
+                        run_and_reply_or_park(
+                            &mut manager,
+                            ParkedRequest::Lookup {
+                                request_id,
+                                reply_to,
+                                service,
+                                member,
+                                tid,
+                            },
+                        )
                         .await;
                     }
-                }
+                    // Plain unlocked read: reply immediately.
+                    None => {
+                        let result = manager.lookup(&member, &service, None).await;
+                        let response = match result {
+                            Ok(val) => MeerkatMessage::LookupResponse {
+                                request_id,
+                                value: serde_json::to_string(&val).unwrap_or_default(),
+                            },
+                            Err(e) => MeerkatMessage::LookupError {
+                                request_id,
+                                error: e.to_string(),
+                            },
+                        };
+                        if let Some(net) = manager.network.as_mut() {
+                            net.handle_command(NetworkCommand::SendMessage {
+                                addr: Address::new(&reply_to),
+                                msg: response,
+                            })
+                            .await;
+                        }
+                    }
+                },
                 MeerkatMessage::ActionRequest {
                     request_id,
                     service,
@@ -224,40 +360,52 @@ async fn run_server(
                     env: action_env,
                     reply_to,
                     txn_id,
-                } => {
-                    // Part of a distributed transaction: execute under the
-                    // shared id and hold. Standalone: commit immediately.
-                    let result = match txn_id {
-                        Some(tid) => {
-                            manager
-                                .execute_action_participant(&service, &stmts, &action_env, tid)
-                                .await
-                        }
-                        None => {
-                            manager
-                                .execute_action_with_env(&service, &stmts, &action_env)
-                                .await
-                        }
-                    };
-                    let response = MeerkatMessage::ActionResponse {
-                        request_id,
-                        success: result.is_ok(),
-                        error: result.err().map(|e| e.to_string()),
-                    };
-                    if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
+                } => match txn_id {
+                    // Part of a distributed transaction: park if older
+                    // than a holder, otherwise reply.
+                    Some(tid) => {
+                        run_and_reply_or_park(
+                            &mut manager,
+                            ParkedRequest::Action {
+                                request_id,
+                                reply_to,
+                                service,
+                                stmts,
+                                env: action_env,
+                                tid,
+                            },
+                        )
                         .await;
                     }
-                }
+                    // Standalone: commit immediately and reply.
+                    None => {
+                        let result = manager
+                            .execute_action_with_env(&service, &stmts, &action_env)
+                            .await;
+                        let response = MeerkatMessage::ActionResponse {
+                            request_id,
+                            success: result.is_ok(),
+                            error: result.err().map(|e| e.to_string()),
+                        };
+                        if let Some(net) = manager.network.as_mut() {
+                            net.handle_command(NetworkCommand::SendMessage {
+                                addr: Address::new(&reply_to),
+                                msg: response,
+                            })
+                            .await;
+                        }
+                    }
+                },
                 MeerkatMessage::Commit {
                     request_id,
                     txn_id,
                     reply_to,
                 } => {
                     let result = manager.commit_participant(&txn_id).await;
+                    let freed = match &result {
+                        Ok(f) => f.clone(),
+                        Err(_) => HashSet::new(),
+                    };
                     let response = MeerkatMessage::CommitResponse {
                         request_id,
                         success: result.is_ok(),
@@ -270,13 +418,19 @@ async fn run_server(
                         })
                         .await;
                     }
+                    // Wake transactions that were waiting on locks this
+                    // commit just released.
+                    wake_ready(&mut manager, freed).await;
                 }
                 MeerkatMessage::Abort {
                     request_id,
                     txn_id,
                     reply_to,
                 } => {
-                    manager.abort_participant(&txn_id).await;
+                    let freed = manager.abort_participant(&txn_id).await;
+                    // Drop this transaction's own parked requests so they
+                    // do not later wake for an abandoned transaction.
+                    manager.purge_parked_txn(&txn_id);
                     if let Some(net) = manager.network.as_mut() {
                         net.handle_command(NetworkCommand::SendMessage {
                             addr: Address::new(&reply_to),
@@ -284,10 +438,14 @@ async fn run_server(
                         })
                         .await;
                     }
+                    // Wake transactions that were waiting on locks this
+                    // abort just released.
+                    wake_ready(&mut manager, freed).await;
                 }
                 _ => {}
             }
         }
+
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
 }

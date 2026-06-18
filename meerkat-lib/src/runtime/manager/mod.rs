@@ -18,6 +18,39 @@ pub struct Service {
     pub dep: DependAnalysis,         // dependency graph + topo order
 }
 
+/// A remote request parked on a variable's wait queue because the requesting
+/// transaction is older than the current lock holder (wait-die wait). It holds
+/// everything needed to re-dispatch the request and send its deferred reply
+/// once the contended lock frees.
+pub enum ParkedRequest {
+    Action {
+        request_id: u64,
+        reply_to: String,
+        service: String,
+        stmts: Vec<ActionStmt>,
+        env: Vec<(String, Value)>,
+        tid: TxnId,
+    },
+    Lookup {
+        request_id: u64,
+        reply_to: String,
+        service: String,
+        member: String,
+        tid: TxnId,
+    },
+}
+
+impl ParkedRequest {
+    /// The transaction this parked request belongs to. Its age decides serve
+    /// order, and identifies it for purging when that transaction aborts.
+    pub fn tid(&self) -> &TxnId {
+        match self {
+            ParkedRequest::Action { tid, .. } => tid,
+            ParkedRequest::Lookup { tid, .. } => tid,
+        }
+    }
+}
+
 pub struct Manager {
     pub services: HashMap<String, Service>,
     /// Maps service name to remote address (for distributed services)
@@ -33,6 +66,10 @@ pub struct Manager {
     /// by a remote originator, executed under a shared id and held (locks +
     /// buffered writes) until a Commit or Abort arrives.
     pub pending_txns: HashMap<TxnId, Transaction>,
+    /// Requests parked because the requesting transaction is older than a lock
+    /// holder (wait-die wait), keyed by the contended (service, var). Drained
+    /// oldest-first when that variable's lock frees on commit or abort.
+    pub wait_queue: HashMap<(ServiceId, String), Vec<ParkedRequest>>,
     /// This node's canonical, dialable address, set once after the network is
     /// listening. Service identities are derived from it, so they are stable for
     /// the life of the process (never empty-then-populated) and match the URL
@@ -51,9 +88,88 @@ impl Manager {
             pending_replies: HashMap::new(),
             node_id: Self::random_node_id(),
             pending_txns: HashMap::new(),
+            wait_queue: HashMap::new(),
             local_address: None,
             local: false,
         }
+    }
+
+    /// Park a request on the wait queue for the contended (service, var). It
+    /// receives no reply until that variable's lock frees and it is re-dispatched.
+    pub fn park_request(&mut self, service: &str, var: String, parked: ParkedRequest) {
+        let key = (self.id_for_service(service), var);
+        self.wait_queue.entry(key).or_default().push(parked);
+    }
+
+    /// After a holder releases locks on commit or abort, return the oldest
+    /// parked request waiting on each freed (service, var), removing it from the
+    /// queue. Serving the oldest first is what keeps an older transaction from
+    /// being starved by a stream of younger requests.
+    pub fn take_ready_waiters(
+        &mut self,
+        freed: &HashSet<(ServiceId, String)>,
+    ) -> Vec<ParkedRequest> {
+        let mut ready = Vec::new();
+        for key in freed {
+            if let Some(waiters) = self.wait_queue.get_mut(key) {
+                if let Some(idx) = waiters
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| a.tid().cmp(b.tid()))
+                    .map(|(i, _)| i)
+                {
+                    ready.push(waiters.remove(idx));
+                    if waiters.is_empty() {
+                        self.wait_queue.remove(key);
+                    }
+                }
+            }
+        }
+        ready
+    }
+
+    /// Remove and return all parked requests belonging to a transaction, used
+    /// when it aborts so its waiters do not later wake and prepare locks for a
+    /// transaction the originator has abandoned.
+    pub fn purge_parked_txn(&mut self, tid: &TxnId) -> Vec<ParkedRequest> {
+        let mut removed = Vec::new();
+        for waiters in self.wait_queue.values_mut() {
+            let mut i = 0;
+            while i < waiters.len() {
+                if waiters[i].tid() == tid {
+                    removed.push(waiters.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        self.wait_queue.retain(|_, v| !v.is_empty());
+        removed
+    }
+
+    /// (request_id, reply_to) for every currently parked request, so the owner
+    /// can periodically reassure waiting originators that they are still queued
+    /// (keepalive), keeping the wait from hitting the reply timeout.
+    pub fn parked_keepalive_targets(&self) -> Vec<(u64, String)> {
+        let mut out = Vec::new();
+        for waiters in self.wait_queue.values() {
+            for p in waiters {
+                let pair = match p {
+                    ParkedRequest::Action {
+                        request_id,
+                        reply_to,
+                        ..
+                    } => (*request_id, reply_to.clone()),
+                    ParkedRequest::Lookup {
+                        request_id,
+                        reply_to,
+                        ..
+                    } => (*request_id, reply_to.clone()),
+                };
+                out.push(pair);
+            }
+        }
+        out
     }
 
     /// Record this node's canonical address once the network is listening, so
@@ -364,6 +480,7 @@ impl Manager {
                         MeerkatMessage::ActionResponse { request_id, .. } => Some(*request_id),
                         MeerkatMessage::CommitResponse { request_id, .. } => Some(*request_id),
                         MeerkatMessage::AbortResponse { request_id, .. } => Some(*request_id),
+                        MeerkatMessage::WaitParked { request_id } => Some(*request_id),
                         _ => None,
                     };
                     if let Some(id) = rid {
@@ -412,9 +529,25 @@ impl Manager {
             tokio::select! {
                 biased;
                 result = &mut rx => {
-                    return result.map_err(|_| {
-                        EvalError::NetworkError("Reply channel closed".to_string())
-                    });
+                    match result {
+                        // Owner parked our request (wait-die wait): it is alive
+                        // and still queued, so reset the timeout, re-register a
+                        // fresh reply channel, and keep waiting.
+                        Ok(MeerkatMessage::WaitParked { .. }) => {
+                            let (ntx, nrx) = oneshot::channel::<MeerkatMessage>();
+                            self.pending_replies.insert(request_id, ntx);
+                            rx = nrx;
+                            timeout
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + Duration::from_secs(15));
+                        }
+                        Ok(msg) => return Ok(msg),
+                        Err(_) => {
+                            return Err(EvalError::NetworkError(
+                                "Reply channel closed".to_string(),
+                            ))
+                        }
+                    }
                 }
                 _ = &mut timeout => {
                     self.pending_replies.remove(&request_id);
@@ -578,6 +711,12 @@ impl Manager {
                 Ok(v)
             }
             Err(e) => {
+                // Wait-die wait: preserve the transaction so the parked read can
+                // resume on release; any other failure releases and drops it.
+                if matches!(e, EvalError::WaitOn(_, _)) {
+                    self.pending_txns.insert(tid, txn);
+                    return Err(e);
+                }
                 // Could not acquire the read lock (e.g. conflict): release any
                 // locks taken and do not keep this transaction prepared.
                 self.release_locks(&txn.locked, &txn.id);
@@ -709,10 +848,15 @@ impl Manager {
         if var_state.lock.try_write(txn_id) {
             Ok(())
         } else {
-            Err(EvalError::LockConflict(format!(
-                "Variable '{}' is already locked; cannot acquire write lock",
-                var
-            )))
+            match var_state.lock.wait_die(txn_id) {
+                crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
+                    "transaction died contending for write lock on '{}'",
+                    var
+                ))),
+                crate::runtime::txn::WaitDie::Wait => {
+                    Err(EvalError::WaitOn(service_name.to_string(), var.to_string()))
+                }
+            }
         }
     }
 
@@ -734,10 +878,15 @@ impl Manager {
         if var_state.lock.try_read(txn_id) {
             Ok(())
         } else {
-            Err(EvalError::LockConflict(format!(
-                "Variable '{}' is write-locked by another transaction",
-                var
-            )))
+            match var_state.lock.wait_die(txn_id) {
+                crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
+                    "transaction died contending for read lock on '{}'",
+                    var
+                ))),
+                crate::runtime::txn::WaitDie::Wait => {
+                    Err(EvalError::WaitOn(service_name.to_string(), var.to_string()))
+                }
+            }
         }
     }
 
@@ -759,10 +908,15 @@ impl Manager {
         if var_state.lock.upgrade_to_write(txn_id) {
             Ok(())
         } else {
-            Err(EvalError::LockConflict(format!(
-                "Variable '{}' cannot be upgraded to a write lock; held by another transaction",
-                var
-            )))
+            match var_state.lock.wait_die(txn_id) {
+                crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
+                    "transaction died contending to upgrade lock on '{}'",
+                    var
+                ))),
+                crate::runtime::txn::WaitDie::Wait => {
+                    Err(EvalError::WaitOn(service_name.to_string(), var.to_string()))
+                }
+            }
         }
     }
 
@@ -797,48 +951,77 @@ impl Manager {
         stmts: &[ActionStmt],
         initial_env: &[(String, Value)],
     ) -> Result<(), EvalError> {
-        // The transaction owns all its state and is passed down through
-        // execution; nothing transaction-specific lives on the Manager.
-        let mut txn = Transaction::new(TxnId::new(self.node_id));
+        // Wait-die: a transaction that dies on a lock conflict (an older
+        // transaction holds the lock) aborts and retries with a higher
+        // iteration but the same age, bounded so a permanently held lock
+        // cannot loop forever. True blocking for the "wait" case (the older
+        // transaction holding its place) is tracked separately under #30
+        // stage 2.
+        const MAX_WAIT_DIE_RETRIES: u32 = 10;
+        let mut txn_id = TxnId::new(self.node_id);
 
-        // Execute statements; read/write locks are acquired lazily inside
-        // lookup/assign as variables are accessed
-        let mut env: Vec<(String, Value)> = initial_env.to_vec();
-        let mut exec_error: Option<EvalError> = None;
-        for stmt in stmts {
-            match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
-                Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
-                Ok(_) => {}
-                Err(e) => {
-                    exec_error = Some(e);
-                    break;
+        loop {
+            // The transaction owns all its state and is passed down through
+            // execution; nothing transaction-specific lives on the Manager.
+            let mut txn = Transaction::new(txn_id.clone());
+
+            // Execute statements; read/write locks are acquired lazily inside
+            // lookup/assign as variables are accessed
+            let mut env: Vec<(String, Value)> = initial_env.to_vec();
+            let mut exec_error: Option<EvalError> = None;
+            for stmt in stmts {
+                match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
+                    Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
+                    Ok(_) => {}
+                    Err(e) => {
+                        exec_error = Some(e);
+                        break;
+                    }
                 }
             }
-        }
 
-        // The commit/abort decision depends only on whether execution
-        // succeeded. Once execution succeeds the writes are applied and become
-        // visible, so commit messaging to participants is best-effort and never
-        // turns a successful transaction into a failed one (commit retries are
-        // tracked separately under issue #54).
-        if exec_error.is_none() {
-            self.apply_committed_writes(&txn).await;
-            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                let _ = self.send_commit(addr, &txn.id).await;
+            // Wait-die abort: discard this attempt, abort participants, release
+            // locks, and retry with a higher iteration up to the bound. A died
+            // attempt never applies its buffered writes, so re-running from
+            // scratch is safe.
+            if matches!(exec_error, Some(EvalError::WaitDieAbort(_))) {
+                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                    self.send_abort(addr, &txn.id).await;
+                }
+                self.release_locks(&txn.locked, &txn.id);
+                if txn_id.iteration < MAX_WAIT_DIE_RETRIES {
+                    txn_id = txn_id.retry();
+                    continue;
+                }
+                return Err(exec_error.unwrap());
             }
-        } else {
-            // Execution failed: discard buffered writes and abort participants.
-            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                self.send_abort(addr, &txn.id).await;
+
+            // The commit/abort decision depends only on whether execution
+            // succeeded. Once execution succeeds the writes are applied and
+            // become visible, so commit messaging to participants is
+            // best-effort and never turns a successful transaction into a
+            // failed one (commit retries are tracked separately under issue
+            // #54).
+            if exec_error.is_none() {
+                self.apply_committed_writes(&txn).await;
+                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                    let _ = self.send_commit(addr, &txn.id).await;
+                }
+            } else {
+                // Execution failed: discard buffered writes and abort
+                // participants.
+                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                    self.send_abort(addr, &txn.id).await;
+                }
             }
-        }
 
-        // Release all locks held locally (always, even on error)
-        self.release_locks(&txn.locked, &txn.id);
+            // Release all locks held locally (always, even on error)
+            self.release_locks(&txn.locked, &txn.id);
 
-        match exec_error {
-            Some(e) => Err(e),
-            None => Ok(()),
+            return match exec_error {
+                Some(e) => Err(e),
+                None => Ok(()),
+            };
         }
     }
 
@@ -902,7 +1085,17 @@ impl Manager {
             }
         }
         if let Some(e) = exec_error {
-            // Execution failed: release all locks held by this (possibly merged)
+            // Wait-die wait: this transaction is older than a current holder and
+            // must wait for the contended variable to free. Preserve its partial
+            // locks and buffered writes in pending_txns so that a re-dispatch on
+            // release skips the locks it already holds (guarded by txn.locked)
+            // and resumes at the contended variable. The owner parks the
+            // request; nothing is released here.
+            if matches!(e, EvalError::WaitOn(_, _)) {
+                self.pending_txns.insert(tid, txn);
+                return Err(e);
+            }
+            // Any other failure: release all locks held by this (possibly merged)
             // transaction; do not keep it prepared. The originator's abort for
             // this tid will then be a safe no-op here.
             self.release_locks(&txn.locked, &txn.id);
@@ -914,9 +1107,13 @@ impl Manager {
     }
 
     /// Participant side: apply and release a held transaction on Commit.
-    pub async fn commit_participant(&mut self, tid: &TxnId) -> Result<(), EvalError> {
+    pub async fn commit_participant(
+        &mut self,
+        tid: &TxnId,
+    ) -> Result<HashSet<(ServiceId, String)>, EvalError> {
         if let Some(txn) = self.pending_txns.remove(tid) {
             // The originator decided to commit, so applying is infallible.
+            let freed = txn.locked.clone();
             self.apply_committed_writes(&txn).await;
             self.release_locks(&txn.locked, &txn.id);
             // Forward the commit down the chain to any sub-participants this node
@@ -930,21 +1127,25 @@ impl Manager {
             }
             match forward_err {
                 Some(e) => Err(e),
-                None => Ok(()),
+                None => Ok(freed),
             }
         } else {
-            Ok(())
+            Ok(HashSet::new())
         }
     }
 
     /// Participant side: discard and release a held transaction on Abort, and
     /// forward the abort down the chain to any sub-participants.
-    pub async fn abort_participant(&mut self, tid: &TxnId) {
+    pub async fn abort_participant(&mut self, tid: &TxnId) -> HashSet<(ServiceId, String)> {
         if let Some(txn) = self.pending_txns.remove(tid) {
+            let freed = txn.locked.clone();
             self.release_locks(&txn.locked, &txn.id);
             for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                 self.send_abort(addr, tid).await;
             }
+            freed
+        } else {
+            HashSet::new()
         }
     }
 
@@ -1463,5 +1664,400 @@ mod tests {
                 .lock,
             crate::runtime::txn::VarLock::Unlocked
         ));
+    }
+
+    // Wait-die: a younger transaction contending for a lock held by an older
+    // transaction dies (abort) rather than acquiring it.
+    #[tokio::test]
+    async fn test_wait_die_younger_dies_at_acquire() {
+        let mut manager = Manager::new();
+        manager
+            .create_service(
+                "s1".to_string(),
+                vec![Decl::VarDecl {
+                    name: "x".to_string(),
+                    val: Expr::Literal {
+                        val: Value::Number { val: 0 },
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        let older = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        manager
+            .services
+            .get_mut("s1")
+            .unwrap()
+            .vars
+            .get_mut("x")
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(older);
+        let younger = crate::runtime::txn::TxnId {
+            timestamp: u128::MAX,
+            node_id: 1,
+            iteration: 0,
+        };
+        let result = manager.acquire_write_lock("s1", "x", &younger);
+        assert!(matches!(result, Err(EvalError::WaitDieAbort(_))));
+    }
+
+    // Wait-die: an older transaction contending for a lock held by a younger
+    // transaction takes the wait path, surfaced as WaitOn carrying the
+    // contended (service, var) so the owner can park the request.
+    #[tokio::test]
+    async fn test_wait_die_older_takes_wait_path() {
+        let mut manager = Manager::new();
+        manager
+            .create_service(
+                "s1".to_string(),
+                vec![Decl::VarDecl {
+                    name: "x".to_string(),
+                    val: Expr::Literal {
+                        val: Value::Number { val: 0 },
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        let younger = crate::runtime::txn::TxnId {
+            timestamp: u128::MAX,
+            node_id: 1,
+            iteration: 0,
+        };
+        manager
+            .services
+            .get_mut("s1")
+            .unwrap()
+            .vars
+            .get_mut("x")
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(younger);
+        let older = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        let result = manager.acquire_write_lock("s1", "x", &older);
+        assert!(matches!(result, Err(EvalError::WaitOn(_, _))));
+    }
+
+    // Wait-die end to end: an action whose variable is held by an older
+    // transaction dies and retries, and after exhausting the bounded retries
+    // returns WaitDieAbort without disturbing the older holder's lock.
+    #[tokio::test]
+    async fn test_wait_die_action_dies_and_retries() {
+        let mut manager = Manager::new();
+        manager
+            .create_service(
+                "s1".to_string(),
+                vec![Decl::VarDecl {
+                    name: "x".to_string(),
+                    val: Expr::Literal {
+                        val: Value::Number { val: 0 },
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        let older = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        manager
+            .services
+            .get_mut("s1")
+            .unwrap()
+            .vars
+            .get_mut("x")
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(older);
+        let stmts = vec![ActionStmt::Assign {
+            var: "x".to_string(),
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable {
+                    ident: "x".to_string(),
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Number { val: 1 },
+                }),
+            },
+        }];
+        let result = manager.execute_action("s1", &stmts).await;
+        assert!(matches!(result, Err(EvalError::WaitDieAbort(_))));
+        assert!(matches!(
+            manager
+                .services
+                .get("s1")
+                .unwrap()
+                .vars
+                .get("x")
+                .unwrap()
+                .lock,
+            crate::runtime::txn::VarLock::WriteLocked(_)
+        ));
+    }
+
+    // Wait-die: a participant action that conflicts mid-execution parks by
+    // preserving its partial transaction (locks already taken stay held) in
+    // pending_txns, so a later re-dispatch can resume rather than restart.
+    #[tokio::test]
+    async fn test_wait_die_participant_preserves_partial_txn() {
+        let mut manager = Manager::new();
+        manager
+            .create_service(
+                "s1".to_string(),
+                vec![
+                    Decl::VarDecl {
+                        name: "y".to_string(),
+                        val: Expr::Literal {
+                            val: Value::Number { val: 0 },
+                        },
+                    },
+                    Decl::VarDecl {
+                        name: "x".to_string(),
+                        val: Expr::Literal {
+                            val: Value::Number { val: 0 },
+                        },
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        // A younger transaction holds a write lock on x.
+        let younger = crate::runtime::txn::TxnId {
+            timestamp: u128::MAX,
+            node_id: 1,
+            iteration: 0,
+        };
+        manager
+            .services
+            .get_mut("s1")
+            .unwrap()
+            .vars
+            .get_mut("x")
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(younger);
+        // Older transaction: write y (acquires y), then touch x (conflict, waits).
+        let older = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        let stmts = vec![
+            ActionStmt::Assign {
+                var: "y".to_string(),
+                expr: Expr::Literal {
+                    val: Value::Number { val: 5 },
+                },
+            },
+            ActionStmt::Assign {
+                var: "x".to_string(),
+                expr: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable {
+                        ident: "x".to_string(),
+                    }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Number { val: 1 },
+                    }),
+                },
+            },
+        ];
+        let result = manager
+            .execute_action_participant("s1", &stmts, &[], older.clone())
+            .await;
+        // Parked: returns WaitOn, and the partial transaction is preserved.
+        assert!(matches!(result, Err(EvalError::WaitOn(_, _))));
+        assert!(manager.pending_txns.contains_key(&older));
+        // The lock it already took on y is still held (not released on park).
+        assert!(matches!(
+            manager
+                .services
+                .get("s1")
+                .unwrap()
+                .vars
+                .get("y")
+                .unwrap()
+                .lock,
+            crate::runtime::txn::VarLock::WriteLocked(_)
+        ));
+    }
+
+    // Wait-die: parked requests on a variable are served oldest-first when the
+    // lock frees, and a transaction's waiters are purged when it aborts.
+    #[tokio::test]
+    async fn test_wait_queue_oldest_first_and_purge() {
+        let mut manager = Manager::new();
+        manager
+            .create_service(
+                "s1".to_string(),
+                vec![Decl::VarDecl {
+                    name: "x".to_string(),
+                    val: Expr::Literal {
+                        val: Value::Number { val: 0 },
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        let make = |rid: u64, tid: crate::runtime::txn::TxnId| ParkedRequest::Action {
+            request_id: rid,
+            reply_to: String::new(),
+            service: "s1".to_string(),
+            stmts: vec![],
+            env: vec![],
+            tid,
+        };
+        let old = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        let mid = crate::runtime::txn::TxnId {
+            timestamp: 5,
+            node_id: 1,
+            iteration: 0,
+        };
+        manager.park_request("s1", "x".to_string(), make(1, mid.clone()));
+        manager.park_request("s1", "x".to_string(), make(2, old.clone()));
+        // Freeing x yields the oldest waiter first; the other stays parked.
+        let mut freed = std::collections::HashSet::new();
+        freed.insert((manager.id_for_service("s1"), "x".to_string()));
+        let ready = manager.take_ready_waiters(&freed);
+        assert_eq!(ready.len(), 1);
+        assert!(ready[0].tid() == &old);
+        // The remaining (mid) waiter is purged when its transaction aborts.
+        let removed = manager.purge_parked_txn(&mid);
+        assert_eq!(removed.len(), 1);
+        assert!(manager.wait_queue.is_empty());
+    }
+
+    // Wait-die end to end (single node, no network): an older transaction parks
+    // on a variable held by a younger one; when the younger aborts and frees the
+    // lock, the parked request is taken oldest-first and its re-run resumes from
+    // the preserved transaction and now succeeds.
+    #[tokio::test]
+    async fn test_wait_die_parked_request_resumes_after_release() {
+        let mut manager = Manager::new();
+        manager
+            .create_service(
+                "s1".to_string(),
+                vec![Decl::VarDecl {
+                    name: "x".to_string(),
+                    val: Expr::Literal {
+                        val: Value::Number { val: 0 },
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+
+        // A younger transaction holds a write lock on x, prepared in pending_txns.
+        let younger = crate::runtime::txn::TxnId {
+            timestamp: u128::MAX,
+            node_id: 1,
+            iteration: 0,
+        };
+        manager
+            .services
+            .get_mut("s1")
+            .unwrap()
+            .vars
+            .get_mut("x")
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(younger.clone());
+        let mut younger_txn = crate::runtime::txn::Transaction::new(younger.clone());
+        younger_txn
+            .locked
+            .insert((manager.id_for_service("s1"), "x".to_string()));
+        manager.pending_txns.insert(younger.clone(), younger_txn);
+
+        // Older transaction: x = x + 1 conflicts -> WaitOn -> park it.
+        let older = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        let stmts = vec![ActionStmt::Assign {
+            var: "x".to_string(),
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable {
+                    ident: "x".to_string(),
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Number { val: 1 },
+                }),
+            },
+        }];
+        let r1 = manager
+            .execute_action_participant("s1", &stmts, &[], older.clone())
+            .await;
+        assert!(matches!(r1, Err(EvalError::WaitOn(_, _))));
+        manager.park_request(
+            "s1",
+            "x".to_string(),
+            ParkedRequest::Action {
+                request_id: 1,
+                reply_to: String::new(),
+                service: "s1".to_string(),
+                stmts: stmts.clone(),
+                env: vec![],
+                tid: older.clone(),
+            },
+        );
+
+        // The younger holder aborts, freeing x.
+        let freed = manager.abort_participant(&younger).await;
+        assert!(matches!(
+            manager
+                .services
+                .get("s1")
+                .unwrap()
+                .vars
+                .get("x")
+                .unwrap()
+                .lock,
+            crate::runtime::txn::VarLock::Unlocked
+        ));
+
+        // Wake: take the oldest waiter and re-run it; it should now succeed.
+        let ready = manager.take_ready_waiters(&freed);
+        assert_eq!(ready.len(), 1);
+        if let ParkedRequest::Action {
+            service,
+            stmts,
+            env,
+            tid,
+            ..
+        } = &ready[0]
+        {
+            let r2 = manager
+                .execute_action_participant(service, stmts, env, tid.clone())
+                .await;
+            assert!(r2.is_ok());
+        } else {
+            panic!("expected an Action waiter");
+        }
+
+        // The older transaction now holds x's write lock and is prepared.
+        assert!(matches!(
+            manager
+                .services
+                .get("s1")
+                .unwrap()
+                .vars
+                .get("x")
+                .unwrap()
+                .lock,
+            crate::runtime::txn::VarLock::WriteLocked(_)
+        ));
+        assert!(manager.pending_txns.contains_key(&older));
     }
 }
