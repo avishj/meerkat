@@ -50,47 +50,36 @@ impl ServiceNetId {
 pub enum MeerkatMessage {
     /// Ping for testing
     Ping {
-        /// The payload string for the ping
         content: String,
     },
 
     /// Pong response
     Pong {
-        /// The payload string for the pong
         content: String,
     },
 
     /// Peer announcement with their canonical `Address`
     Announce {
-        /// The announced peer address
         peer_addr: Address,
     },
 
     /// Transaction message (for future use)
     Transaction {
-        /// The transaction identifier
         tx_id: u64,
-        /// The raw transaction payload
         payload: Vec<u8>,
     },
 
     /// Propagation message (for future use)
     Propagation {
-        /// The variable identifier
         var_id: u64,
-        /// The new value serialized
         new_value: Vec<u8>,
     },
 
     /// Request to look up a member of a service on a remote node
     LookupRequest {
-        /// The unique request identifier
         request_id: u64,
-        /// The target service name
         service: String,
-        /// The member to resolve
         member: String,
-        /// The full multiaddr of the requester
         reply_to: String,
         /// When `Some`, the read joins this transaction: the owning node
         /// acquires and holds a read lock under the shared `txn_id`
@@ -101,31 +90,22 @@ pub enum MeerkatMessage {
 
     /// Response to a `LookupRequest` with the serialized value
     LookupResponse {
-        /// The request identifier corresponding to the lookup request
         request_id: u64,
-        /// The retrieved network representation of the value
         value: NetValue,
     },
 
     /// Response indicating lookup failed
     LookupError {
-        /// The request identifier corresponding to the lookup request
         request_id: u64,
-        /// The error message details
         error: String,
     },
 
     /// Execute an action on a remote service
     ActionRequest {
-        /// The unique request identifier
         request_id: u64,
-        /// The target service name
         service: String,
-        /// The sequence of statements to execute
         stmts: Vec<NetActionStmt>,
-        /// The environment bindings mapping keys to network values
         env: Vec<(String, NetValue)>,
-        /// The full multiaddr of the requester
         reply_to: String,
         /// When `Some`, the action joins the originator's distributed
         /// transaction: execute under this shared `txn_id` and hold
@@ -136,11 +116,8 @@ pub enum MeerkatMessage {
 
     /// Response to `ActionRequest`
     ActionResponse {
-        /// The request identifier corresponding to the action request
         request_id: u64,
-        /// Indicates if the action succeeded
         success: bool,
-        /// The error details if the action failed
         error: Option<String>,
     },
 
@@ -148,22 +125,16 @@ pub enum MeerkatMessage {
     /// apply the writes it buffered for `txn_id` and release the
     /// locks it holds
     Commit {
-        /// The request identifier for tracking
         request_id: u64,
-        /// The transaction identifier to commit
         txn_id: TxnId,
-        /// The full multiaddr of the sender
         reply_to: String,
     },
 
     /// Acknowledgement that a `Commit` was applied (or failed) on a
     /// participant
     CommitResponse {
-        /// The request identifier
         request_id: u64,
-        /// Indicates if the commit succeeded
         success: bool,
-        /// The error details if the commit failed
         error: Option<String>,
     },
 
@@ -173,17 +144,13 @@ pub enum MeerkatMessage {
     /// Acknowledged so the originator knows the participant's locks
     /// are freed before it returns (and exits)
     Abort {
-        /// The request identifier
         request_id: u64,
-        /// The transaction identifier to abort
         txn_id: TxnId,
-        /// The full multiaddr of the sender
         reply_to: String,
     },
 
     /// Acknowledgement that an `Abort` was processed on a participant
     AbortResponse {
-        /// The request identifier corresponding to the abort request
         request_id: u64,
     },
 
@@ -192,7 +159,6 @@ pub enum MeerkatMessage {
     /// request is alive and still queued, so it keeps waiting
     /// instead of timing out
     WaitParked {
-        /// The request identifier that was parked
         request_id: u64,
     },
 }
