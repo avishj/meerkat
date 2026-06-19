@@ -5,8 +5,17 @@
 //!
 //! This implementation intentionally copies strings to avoid viral
 //! lifetime annotations
+//!
+//! Callers must validate all inputs against the `limits.rs` file.
+//! Returning a `Result` from the interner would require pattern
+//! matching across the entire library, bloating the codebase
+//! massively. The `assert` provides a fail-fast panic to protect
+//! the interner's internal state. Input validation is the caller's
+//! responsibility exclusively at zero-trust boundary entry points
 
 use std::collections::HashMap;
+
+use crate::runtime::limits::MAX_IDENTIFIER_LENGTH;
 
 /// A numeric representation of an identifier or symbol
 ///
@@ -121,6 +130,10 @@ impl Interner {
     /// Returns:
     ///     `Symbol`: The unique symbol representing the string
     pub fn insert(&mut self, s: &str) -> Symbol {
+        assert!(
+            s.len() <= MAX_IDENTIFIER_LENGTH,
+            "it exceeded the maximum identifier limit"
+        );
         if let Some(&id) = self.index.get(s) {
             return Symbol { id };
         }
@@ -256,5 +269,15 @@ mod tests {
         sym2.hash(&mut h2);
 
         assert_eq!(h1.finish(), h2.finish());
+    }
+
+    /// Verify that inserting an identifier exceeding the length
+    /// limit panics
+    #[test]
+    #[should_panic(expected = "it exceeded the maximum identifier limit")]
+    fn test_interner_exceeds_identifier_limit_panics() {
+        let mut interner = Interner::new();
+        let long_ident = "a".repeat(MAX_IDENTIFIER_LENGTH + 1);
+        interner.insert(&long_ident);
     }
 }

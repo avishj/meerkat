@@ -3,9 +3,31 @@
 //! Provides encoding and decoding functions to map between the native
 //! `AST` types and the serialized network representation variants
 
+use crate::error::{Error, Result};
 use crate::net::ast::{NetActionStmt, NetBinOp, NetDataType, NetExpr, NetField, NetUnOp, NetValue};
 use crate::runtime::ast::{ActionStmt, BinOp, DataType, Expr, Field, UnOp, Value};
 use crate::runtime::interner::Interner;
+use crate::runtime::limits::{MAX_IDENTIFIER_LENGTH, MAX_STRING_LITERAL_LENGTH};
+
+fn validate_identifier(s: &str) -> Result<()> {
+    if s.len() > MAX_IDENTIFIER_LENGTH {
+        return Err(Error::LimitExceeded(format!(
+            "identifier exceeds maximum length of {} characters",
+            MAX_IDENTIFIER_LENGTH
+        )));
+    }
+    Ok(())
+}
+
+fn validate_string_literal(s: &str) -> Result<()> {
+    if s.len() > MAX_STRING_LITERAL_LENGTH {
+        return Err(Error::LimitExceeded(format!(
+            "string literal exceeds maximum length of {} characters",
+            MAX_STRING_LITERAL_LENGTH
+        )));
+    }
+    Ok(())
+}
 
 /// Encode a runtime `Value` into a network representation
 ///
@@ -14,53 +36,63 @@ use crate::runtime::interner::Interner;
 ///     interner (`&Interner`): The `Interner` for symbol lookup
 ///
 /// Returns:
-///     `NetValue`: The encoded `NetValue` network representation
-pub fn encode_value(val: &Value, interner: &Interner) -> NetValue {
+///     `Result<NetValue>`: The encoded `NetValue` network representation
+pub fn encode_value(val: &Value, interner: &Interner) -> Result<NetValue> {
     match val {
-        Value::Number { val } => NetValue::Number { val: *val },
-        Value::Bool { val } => NetValue::Bool { val: *val },
-        Value::String { val } => NetValue::String { val: val.clone() },
+        Value::Number { val } => Ok(NetValue::Number { val: *val }),
+        Value::Bool { val } => Ok(NetValue::Bool { val: *val }),
+        Value::String { val } => {
+            validate_string_literal(val)?;
+            Ok(NetValue::String { val: val.clone() })
+        }
         Value::Closure {
             params,
             body,
             env,
             service_name,
         } => {
-            let encoded_params = params
-                .iter()
-                .map(|p| interner.get(*p).to_string())
-                .collect();
-            let encoded_body = Box::new(encode_expr(body, interner));
-            let encoded_env = env
-                .iter()
-                .map(|(k, v)| (interner.get(*k).to_string(), encode_value(v, interner)))
-                .collect();
-            let encoded_service = interner.get(*service_name).to_string();
-            NetValue::Closure {
+            let mut encoded_params = Vec::new();
+            for p in params {
+                let p_str = interner.get(*p);
+                validate_identifier(p_str)?;
+                encoded_params.push(p_str.to_string());
+            }
+            let encoded_body = Box::new(encode_expr(body, interner)?);
+            let mut encoded_env = Vec::new();
+            for (k, v) in env {
+                let k_str = interner.get(*k);
+                validate_identifier(k_str)?;
+                encoded_env.push((k_str.to_string(), encode_value(v, interner)?));
+            }
+            let service_str = interner.get(*service_name);
+            validate_identifier(service_str)?;
+            Ok(NetValue::Closure {
                 params: encoded_params,
                 body: encoded_body,
                 env: encoded_env,
-                service_name: encoded_service,
-            }
+                service_name: service_str.to_string(),
+            })
         }
         Value::ActionClosure {
             stmts,
             env,
             service_net_id,
         } => {
-            let encoded_stmts = stmts
-                .iter()
-                .map(|s| encode_action_stmt(s, interner))
-                .collect();
-            let encoded_env = env
-                .iter()
-                .map(|(k, v)| (interner.get(*k).to_string(), encode_value(v, interner)))
-                .collect();
-            NetValue::ActionClosure {
+            let mut encoded_stmts = Vec::new();
+            for s in stmts {
+                encoded_stmts.push(encode_action_stmt(s, interner)?);
+            }
+            let mut encoded_env = Vec::new();
+            for (k, v) in env {
+                let k_str = interner.get(*k);
+                validate_identifier(k_str)?;
+                encoded_env.push((k_str.to_string(), encode_value(v, interner)?));
+            }
+            Ok(NetValue::ActionClosure {
                 stmts: encoded_stmts,
                 env: encoded_env,
                 service_net_id: service_net_id.clone(),
-            }
+            })
         }
     }
 }
@@ -72,50 +104,59 @@ pub fn encode_value(val: &Value, interner: &Interner) -> NetValue {
 ///     interner (`&mut Interner`): The `Interner` for symbol creation
 ///
 /// Returns:
-///     `Value`: The decoded runtime `Value`
-pub fn decode_value(val: NetValue, interner: &mut Interner) -> Value {
+///     `Result<Value>`: The decoded runtime `Value`
+pub fn decode_value(val: NetValue, interner: &mut Interner) -> Result<Value> {
     match val {
-        NetValue::Number { val } => Value::Number { val },
-        NetValue::Bool { val } => Value::Bool { val },
-        NetValue::String { val } => Value::String { val },
+        NetValue::Number { val } => Ok(Value::Number { val }),
+        NetValue::Bool { val } => Ok(Value::Bool { val }),
+        NetValue::String { val } => {
+            validate_string_literal(&val)?;
+            Ok(Value::String { val })
+        }
         NetValue::Closure {
             params,
             body,
             env,
             service_name,
         } => {
+            for p in &params {
+                validate_identifier(p)?;
+            }
             let decoded_params = params.into_iter().map(|p| interner.insert(&p)).collect();
-            let decoded_body = Box::new(decode_expr(*body, interner));
-            let decoded_env = env
-                .into_iter()
-                .map(|(k, v)| (interner.insert(&k), decode_value(v, interner)))
-                .collect();
+            let decoded_body = Box::new(decode_expr(*body, interner)?);
+            let mut decoded_env = Vec::new();
+            for (k, v) in env {
+                validate_identifier(&k)?;
+                decoded_env.push((interner.insert(&k), decode_value(v, interner)?));
+            }
+            validate_identifier(&service_name)?;
             let decoded_service = interner.insert(&service_name);
-            Value::Closure {
+            Ok(Value::Closure {
                 params: decoded_params,
                 body: decoded_body,
                 env: decoded_env,
                 service_name: decoded_service,
-            }
+            })
         }
         NetValue::ActionClosure {
             stmts,
             env,
             service_net_id,
         } => {
-            let decoded_stmts = stmts
-                .into_iter()
-                .map(|s| decode_action_stmt(s, interner))
-                .collect();
-            let decoded_env = env
-                .into_iter()
-                .map(|(k, v)| (interner.insert(&k), decode_value(v, interner)))
-                .collect();
-            Value::ActionClosure {
+            let mut decoded_stmts = Vec::new();
+            for s in stmts {
+                decoded_stmts.push(decode_action_stmt(s, interner)?);
+            }
+            let mut decoded_env = Vec::new();
+            for (k, v) in env {
+                validate_identifier(&k)?;
+                decoded_env.push((interner.insert(&k), decode_value(v, interner)?));
+            }
+            Ok(Value::ActionClosure {
                 stmts: decoded_stmts,
                 env: decoded_env,
                 service_net_id,
-            }
+            })
         }
     }
 }
@@ -127,87 +168,142 @@ pub fn decode_value(val: NetValue, interner: &mut Interner) -> Value {
 ///     interner (`&Interner`): The `Interner` for symbol lookup
 ///
 /// Returns:
-///     `NetExpr`: The encoded `NetExpr` network representation
-pub fn encode_expr(expr: &Expr, interner: &Interner) -> NetExpr {
+///     `Result<NetExpr>`: The encoded `NetExpr` network representation
+pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
     match expr {
-        Expr::Literal { val } => NetExpr::Literal {
-            val: encode_value(val, interner),
-        },
-        Expr::Variable { name } => NetExpr::Variable {
-            name: interner.get(*name).to_string(),
-        },
-        Expr::Tuple { val } => NetExpr::Tuple {
-            val: val.iter().map(|e| encode_expr(e, interner)).collect(),
-        },
-        Expr::KeyVal { name, value } => NetExpr::KeyVal {
-            name: interner.get(*name).to_string(),
-            value: Box::new(encode_expr(value, interner)),
-        },
-        Expr::Unop { op, expr } => NetExpr::Unop {
+        Expr::Literal { val } => Ok(NetExpr::Literal {
+            val: encode_value(val, interner)?,
+        }),
+        Expr::Variable { name } => {
+            let name_str = interner.get(*name);
+            validate_identifier(name_str)?;
+            Ok(NetExpr::Variable {
+                name: name_str.to_string(),
+            })
+        }
+        Expr::Tuple { val } => {
+            let mut encoded_val = Vec::new();
+            for e in val {
+                encoded_val.push(encode_expr(e, interner)?);
+            }
+            Ok(NetExpr::Tuple { val: encoded_val })
+        }
+        Expr::KeyVal { name, value } => {
+            let name_str = interner.get(*name);
+            validate_identifier(name_str)?;
+            Ok(NetExpr::KeyVal {
+                name: name_str.to_string(),
+                value: Box::new(encode_expr(value, interner)?),
+            })
+        }
+        Expr::Unop { op, expr } => Ok(NetExpr::Unop {
             op: encode_unop(*op),
-            expr: Box::new(encode_expr(expr, interner)),
-        },
-        Expr::Binop { op, expr1, expr2 } => NetExpr::Binop {
+            expr: Box::new(encode_expr(expr, interner)?),
+        }),
+        Expr::Binop { op, expr1, expr2 } => Ok(NetExpr::Binop {
             op: encode_binop(*op),
-            expr1: Box::new(encode_expr(expr1, interner)),
-            expr2: Box::new(encode_expr(expr2, interner)),
-        },
-        Expr::If { cond, expr1, expr2 } => NetExpr::If {
-            cond: Box::new(encode_expr(cond, interner)),
-            expr1: Box::new(encode_expr(expr1, interner)),
-            expr2: Box::new(encode_expr(expr2, interner)),
-        },
-        Expr::Func { params, body } => NetExpr::Func {
-            params: params
-                .iter()
-                .map(|p| interner.get(*p).to_string())
-                .collect(),
-            body: Box::new(encode_expr(body, interner)),
-        },
-        Expr::Call { func, args } => NetExpr::Call {
-            func: Box::new(encode_expr(func, interner)),
-            args: args.iter().map(|e| encode_expr(e, interner)).collect(),
-        },
-        Expr::Action(stmts) => NetExpr::Action(
-            stmts
-                .iter()
-                .map(|s| encode_action_stmt(s, interner))
-                .collect(),
-        ),
+            expr1: Box::new(encode_expr(expr1, interner)?),
+            expr2: Box::new(encode_expr(expr2, interner)?),
+        }),
+        Expr::If { cond, expr1, expr2 } => Ok(NetExpr::If {
+            cond: Box::new(encode_expr(cond, interner)?),
+            expr1: Box::new(encode_expr(expr1, interner)?),
+            expr2: Box::new(encode_expr(expr2, interner)?),
+        }),
+        Expr::Func { params, body } => {
+            let mut encoded_params = Vec::new();
+            for p in params {
+                let p_str = interner.get(*p);
+                validate_identifier(p_str)?;
+                encoded_params.push(p_str.to_string());
+            }
+            let encoded_body = Box::new(encode_expr(body, interner)?);
+            Ok(NetExpr::Func {
+                params: encoded_params,
+                body: encoded_body,
+            })
+        }
+        Expr::Call { func, args } => {
+            let encoded_func = Box::new(encode_expr(func, interner)?);
+            let mut encoded_args = Vec::new();
+            for e in args {
+                encoded_args.push(encode_expr(e, interner)?);
+            }
+            Ok(NetExpr::Call {
+                func: encoded_func,
+                args: encoded_args,
+            })
+        }
+        Expr::Action(stmts) => {
+            let mut encoded_stmts = Vec::new();
+            for s in stmts {
+                encoded_stmts.push(encode_action_stmt(s, interner)?);
+            }
+            Ok(NetExpr::Action(encoded_stmts))
+        }
         Expr::MemberAccess {
             service_name,
             member_name,
-        } => NetExpr::MemberAccess {
-            service_name: interner.get(*service_name).to_string(),
-            member_name: interner.get(*member_name).to_string(),
-        },
+        } => {
+            let service_str = interner.get(*service_name);
+            let member_str = interner.get(*member_name);
+            validate_identifier(service_str)?;
+            validate_identifier(member_str)?;
+            Ok(NetExpr::MemberAccess {
+                service_name: service_str.to_string(),
+                member_name: member_str.to_string(),
+            })
+        }
         Expr::Select {
             table_name,
             column_names,
             where_clause,
-        } => NetExpr::Select {
-            table_name: interner.get(*table_name).to_string(),
-            column_names: column_names
-                .iter()
-                .map(|c| interner.get(*c).to_string())
-                .collect(),
-            where_clause: Box::new(encode_expr(where_clause, interner)),
-        },
-        Expr::Table { schema, records } => NetExpr::Table {
-            schema: schema.iter().map(|f| encode_field(f, interner)).collect(),
-            records: records.iter().map(|r| encode_expr(r, interner)).collect(),
-        },
+        } => {
+            let table_str = interner.get(*table_name);
+            validate_identifier(table_str)?;
+            let mut encoded_cols = Vec::new();
+            for c in column_names {
+                let c_str = interner.get(*c);
+                validate_identifier(c_str)?;
+                encoded_cols.push(c_str.to_string());
+            }
+            Ok(NetExpr::Select {
+                table_name: table_str.to_string(),
+                column_names: encoded_cols,
+                where_clause: Box::new(encode_expr(where_clause, interner)?),
+            })
+        }
+        Expr::Table { schema, records } => {
+            let mut encoded_schema = Vec::new();
+            for f in schema {
+                encoded_schema.push(encode_field(f, interner)?);
+            }
+            let mut encoded_records = Vec::new();
+            for r in records {
+                encoded_records.push(encode_expr(r, interner)?);
+            }
+            Ok(NetExpr::Table {
+                schema: encoded_schema,
+                records: encoded_records,
+            })
+        }
         Expr::Fold {
             table_name,
             column_name,
             operation,
             identity,
-        } => NetExpr::Fold {
-            table_name: interner.get(*table_name).to_string(),
-            column_name: interner.get(*column_name).to_string(),
-            operation: Box::new(encode_expr(operation, interner)),
-            identity: Box::new(encode_expr(identity, interner)),
-        },
+        } => {
+            let table_str = interner.get(*table_name);
+            let column_str = interner.get(*column_name);
+            validate_identifier(table_str)?;
+            validate_identifier(column_str)?;
+            Ok(NetExpr::Fold {
+                table_name: table_str.to_string(),
+                column_name: column_str.to_string(),
+                operation: Box::new(encode_expr(operation, interner)?),
+                identity: Box::new(encode_expr(identity, interner)?),
+            })
+        }
     }
 }
 
@@ -218,90 +314,134 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> NetExpr {
 ///     interner (`&mut Interner`): The `Interner` for symbol creation
 ///
 /// Returns:
-///     `Expr`: The decoded runtime `Expr`
-pub fn decode_expr(expr: NetExpr, interner: &mut Interner) -> Expr {
+///     `Result<Expr>`: The decoded runtime `Expr`
+pub fn decode_expr(expr: NetExpr, interner: &mut Interner) -> Result<Expr> {
     match expr {
-        NetExpr::Literal { val } => Expr::Literal {
-            val: decode_value(val, interner),
-        },
-        NetExpr::Variable { name } => Expr::Variable {
-            name: interner.insert(&name),
-        },
-        NetExpr::Tuple { val } => Expr::Tuple {
-            val: val.into_iter().map(|e| decode_expr(e, interner)).collect(),
-        },
-        NetExpr::KeyVal { name, value } => Expr::KeyVal {
-            name: interner.insert(&name),
-            value: Box::new(decode_expr(*value, interner)),
-        },
-        NetExpr::Unop { op, expr } => Expr::Unop {
+        NetExpr::Literal { val } => Ok(Expr::Literal {
+            val: decode_value(val, interner)?,
+        }),
+        NetExpr::Variable { name } => {
+            validate_identifier(&name)?;
+            Ok(Expr::Variable {
+                name: interner.insert(&name),
+            })
+        }
+        NetExpr::Tuple { val } => {
+            let mut decoded_val = Vec::new();
+            for e in val {
+                decoded_val.push(decode_expr(e, interner)?);
+            }
+            Ok(Expr::Tuple { val: decoded_val })
+        }
+        NetExpr::KeyVal { name, value } => {
+            validate_identifier(&name)?;
+            Ok(Expr::KeyVal {
+                name: interner.insert(&name),
+                value: Box::new(decode_expr(*value, interner)?),
+            })
+        }
+        NetExpr::Unop { op, expr } => Ok(Expr::Unop {
             op: decode_unop(op),
-            expr: Box::new(decode_expr(*expr, interner)),
-        },
-        NetExpr::Binop { op, expr1, expr2 } => Expr::Binop {
+            expr: Box::new(decode_expr(*expr, interner)?),
+        }),
+        NetExpr::Binop { op, expr1, expr2 } => Ok(Expr::Binop {
             op: decode_binop(op),
-            expr1: Box::new(decode_expr(*expr1, interner)),
-            expr2: Box::new(decode_expr(*expr2, interner)),
-        },
-        NetExpr::If { cond, expr1, expr2 } => Expr::If {
-            cond: Box::new(decode_expr(*cond, interner)),
-            expr1: Box::new(decode_expr(*expr1, interner)),
-            expr2: Box::new(decode_expr(*expr2, interner)),
-        },
-        NetExpr::Func { params, body } => Expr::Func {
-            params: params.into_iter().map(|p| interner.insert(&p)).collect(),
-            body: Box::new(decode_expr(*body, interner)),
-        },
-        NetExpr::Call { func, args } => Expr::Call {
-            func: Box::new(decode_expr(*func, interner)),
-            args: args.into_iter().map(|e| decode_expr(e, interner)).collect(),
-        },
-        NetExpr::Action(stmts) => Expr::Action(
-            stmts
-                .into_iter()
-                .map(|s| decode_action_stmt(s, interner))
-                .collect(),
-        ),
+            expr1: Box::new(decode_expr(*expr1, interner)?),
+            expr2: Box::new(decode_expr(*expr2, interner)?),
+        }),
+        NetExpr::If { cond, expr1, expr2 } => Ok(Expr::If {
+            cond: Box::new(decode_expr(*cond, interner)?),
+            expr1: Box::new(decode_expr(*expr1, interner)?),
+            expr2: Box::new(decode_expr(*expr2, interner)?),
+        }),
+        NetExpr::Func { params, body } => {
+            for p in &params {
+                validate_identifier(p)?;
+            }
+            let decoded_params = params.into_iter().map(|p| interner.insert(&p)).collect();
+            let decoded_body = Box::new(decode_expr(*body, interner)?);
+            Ok(Expr::Func {
+                params: decoded_params,
+                body: decoded_body,
+            })
+        }
+        NetExpr::Call { func, args } => {
+            let decoded_func = Box::new(decode_expr(*func, interner)?);
+            let mut decoded_args = Vec::new();
+            for e in args {
+                decoded_args.push(decode_expr(e, interner)?);
+            }
+            Ok(Expr::Call {
+                func: decoded_func,
+                args: decoded_args,
+            })
+        }
+        NetExpr::Action(stmts) => {
+            let mut decoded_stmts = Vec::new();
+            for s in stmts {
+                decoded_stmts.push(decode_action_stmt(s, interner)?);
+            }
+            Ok(Expr::Action(decoded_stmts))
+        }
         NetExpr::MemberAccess {
             service_name,
             member_name,
-        } => Expr::MemberAccess {
-            service_name: interner.insert(&service_name),
-            member_name: interner.insert(&member_name),
-        },
+        } => {
+            validate_identifier(&service_name)?;
+            validate_identifier(&member_name)?;
+            Ok(Expr::MemberAccess {
+                service_name: interner.insert(&service_name),
+                member_name: interner.insert(&member_name),
+            })
+        }
         NetExpr::Select {
             table_name,
             column_names,
             where_clause,
-        } => Expr::Select {
-            table_name: interner.insert(&table_name),
-            column_names: column_names
+        } => {
+            validate_identifier(&table_name)?;
+            for c in &column_names {
+                validate_identifier(c)?;
+            }
+            let decoded_cols = column_names
                 .into_iter()
                 .map(|c| interner.insert(&c))
-                .collect(),
-            where_clause: Box::new(decode_expr(*where_clause, interner)),
-        },
-        NetExpr::Table { schema, records } => Expr::Table {
-            schema: schema
-                .into_iter()
-                .map(|f| decode_field(f, interner))
-                .collect(),
-            records: records
-                .into_iter()
-                .map(|r| decode_expr(r, interner))
-                .collect(),
-        },
+                .collect();
+            Ok(Expr::Select {
+                table_name: interner.insert(&table_name),
+                column_names: decoded_cols,
+                where_clause: Box::new(decode_expr(*where_clause, interner)?),
+            })
+        }
+        NetExpr::Table { schema, records } => {
+            let mut decoded_schema = Vec::new();
+            for f in schema {
+                decoded_schema.push(decode_field(f, interner)?);
+            }
+            let mut decoded_records = Vec::new();
+            for r in records {
+                decoded_records.push(decode_expr(r, interner)?);
+            }
+            Ok(Expr::Table {
+                schema: decoded_schema,
+                records: decoded_records,
+            })
+        }
         NetExpr::Fold {
             table_name,
             column_name,
             operation,
             identity,
-        } => Expr::Fold {
-            table_name: interner.insert(&table_name),
-            column_name: interner.insert(&column_name),
-            operation: Box::new(decode_expr(*operation, interner)),
-            identity: Box::new(decode_expr(*identity, interner)),
-        },
+        } => {
+            validate_identifier(&table_name)?;
+            validate_identifier(&column_name)?;
+            Ok(Expr::Fold {
+                table_name: interner.insert(&table_name),
+                column_name: interner.insert(&column_name),
+                operation: Box::new(decode_expr(*operation, interner)?),
+                identity: Box::new(decode_expr(*identity, interner)?),
+            })
+        }
     }
 }
 
@@ -312,24 +452,36 @@ pub fn decode_expr(expr: NetExpr, interner: &mut Interner) -> Expr {
 ///     interner (`&Interner`): The `Interner` for symbol lookup
 ///
 /// Returns:
-///     `NetActionStmt`: The encoded `NetActionStmt` network representation
-pub fn encode_action_stmt(stmt: &ActionStmt, interner: &Interner) -> NetActionStmt {
+///     `Result<NetActionStmt>`: The encoded `NetActionStmt` network representation
+pub fn encode_action_stmt(stmt: &ActionStmt, interner: &Interner) -> Result<NetActionStmt> {
     match stmt {
-        ActionStmt::Let { name, expr } => NetActionStmt::Let {
-            name: interner.get(*name).to_string(),
-            expr: encode_expr(expr, interner),
-        },
-        ActionStmt::Expr(expr) => NetActionStmt::Expr(encode_expr(expr, interner)),
-        ActionStmt::Do(expr) => NetActionStmt::Do(encode_expr(expr, interner)),
-        ActionStmt::Assert(expr) => NetActionStmt::Assert(encode_expr(expr, interner)),
-        ActionStmt::Assign { name, expr } => NetActionStmt::Assign {
-            name: interner.get(*name).to_string(),
-            expr: encode_expr(expr, interner),
-        },
-        ActionStmt::Insert { row, table_name } => NetActionStmt::Insert {
-            row: encode_expr(row, interner),
-            table_name: interner.get(*table_name).to_string(),
-        },
+        ActionStmt::Let { name, expr } => {
+            let name_str = interner.get(*name);
+            validate_identifier(name_str)?;
+            Ok(NetActionStmt::Let {
+                name: name_str.to_string(),
+                expr: encode_expr(expr, interner)?,
+            })
+        }
+        ActionStmt::Expr(expr) => Ok(NetActionStmt::Expr(encode_expr(expr, interner)?)),
+        ActionStmt::Do(expr) => Ok(NetActionStmt::Do(encode_expr(expr, interner)?)),
+        ActionStmt::Assert(expr) => Ok(NetActionStmt::Assert(encode_expr(expr, interner)?)),
+        ActionStmt::Assign { name, expr } => {
+            let name_str = interner.get(*name);
+            validate_identifier(name_str)?;
+            Ok(NetActionStmt::Assign {
+                name: name_str.to_string(),
+                expr: encode_expr(expr, interner)?,
+            })
+        }
+        ActionStmt::Insert { row, table_name } => {
+            let table_str = interner.get(*table_name);
+            validate_identifier(table_str)?;
+            Ok(NetActionStmt::Insert {
+                row: encode_expr(row, interner)?,
+                table_name: table_str.to_string(),
+            })
+        }
     }
 }
 
@@ -340,24 +492,33 @@ pub fn encode_action_stmt(stmt: &ActionStmt, interner: &Interner) -> NetActionSt
 ///     interner (`&mut Interner`): The `Interner` for symbol creation
 ///
 /// Returns:
-///     `ActionStmt`: The decoded runtime `ActionStmt`
-pub fn decode_action_stmt(stmt: NetActionStmt, interner: &mut Interner) -> ActionStmt {
+///     `Result<ActionStmt>`: The decoded runtime `ActionStmt`
+pub fn decode_action_stmt(stmt: NetActionStmt, interner: &mut Interner) -> Result<ActionStmt> {
     match stmt {
-        NetActionStmt::Let { name, expr } => ActionStmt::Let {
-            name: interner.insert(&name),
-            expr: decode_expr(expr, interner),
-        },
-        NetActionStmt::Expr(expr) => ActionStmt::Expr(decode_expr(expr, interner)),
-        NetActionStmt::Do(expr) => ActionStmt::Do(decode_expr(expr, interner)),
-        NetActionStmt::Assert(expr) => ActionStmt::Assert(decode_expr(expr, interner)),
-        NetActionStmt::Assign { name, expr } => ActionStmt::Assign {
-            name: interner.insert(&name),
-            expr: decode_expr(expr, interner),
-        },
-        NetActionStmt::Insert { row, table_name } => ActionStmt::Insert {
-            row: decode_expr(row, interner),
-            table_name: interner.insert(&table_name),
-        },
+        NetActionStmt::Let { name, expr } => {
+            validate_identifier(&name)?;
+            Ok(ActionStmt::Let {
+                name: interner.insert(&name),
+                expr: decode_expr(expr, interner)?,
+            })
+        }
+        NetActionStmt::Expr(expr) => Ok(ActionStmt::Expr(decode_expr(expr, interner)?)),
+        NetActionStmt::Do(expr) => Ok(ActionStmt::Do(decode_expr(expr, interner)?)),
+        NetActionStmt::Assert(expr) => Ok(ActionStmt::Assert(decode_expr(expr, interner)?)),
+        NetActionStmt::Assign { name, expr } => {
+            validate_identifier(&name)?;
+            Ok(ActionStmt::Assign {
+                name: interner.insert(&name),
+                expr: decode_expr(expr, interner)?,
+            })
+        }
+        NetActionStmt::Insert { row, table_name } => {
+            validate_identifier(&table_name)?;
+            Ok(ActionStmt::Insert {
+                row: decode_expr(row, interner)?,
+                table_name: interner.insert(&table_name),
+            })
+        }
     }
 }
 
@@ -368,12 +529,14 @@ pub fn decode_action_stmt(stmt: NetActionStmt, interner: &mut Interner) -> Actio
 ///     interner (`&Interner`): The `Interner` for symbol lookup
 ///
 /// Returns:
-///     `NetField`: The encoded `NetField` network representation
-pub fn encode_field(field: &Field, interner: &Interner) -> NetField {
-    NetField {
-        name: interner.get(field.name).to_string(),
+///     `Result<NetField>`: The encoded `NetField` network representation
+pub fn encode_field(field: &Field, interner: &Interner) -> Result<NetField> {
+    let name_str = interner.get(field.name);
+    validate_identifier(name_str)?;
+    Ok(NetField {
+        name: name_str.to_string(),
         ty: encode_datatype(&field.ty),
-    }
+    })
 }
 
 /// Decode a network `NetField` representation into a runtime `Field`
@@ -383,12 +546,13 @@ pub fn encode_field(field: &Field, interner: &Interner) -> NetField {
 ///     interner (`&mut Interner`): The `Interner` for symbol creation
 ///
 /// Returns:
-///     `Field`: The decoded runtime `Field`
-pub fn decode_field(field: NetField, interner: &mut Interner) -> Field {
-    Field {
+///     `Result<Field>`: The decoded runtime `Field`
+pub fn decode_field(field: NetField, interner: &mut Interner) -> Result<Field> {
+    validate_identifier(&field.name)?;
+    Ok(Field {
         name: interner.insert(&field.name),
         ty: decode_datatype(field.ty),
-    }
+    })
 }
 
 /// Encode a runtime `UnOp` into its network equivalent
@@ -527,13 +691,13 @@ mod tests {
 
         let orig_str = format!("{}", original_value);
 
-        let encoded = encode_value(&original_value, &interner_orig);
+        let encoded = encode_value(&original_value, &interner_orig).unwrap();
 
         let json_str = serde_json::to_string(&encoded).unwrap();
         let decoded_net_val: NetValue = serde_json::from_str(&json_str).unwrap();
 
         let mut interner_new = Interner::new();
-        let decoded_value = decode_value(decoded_net_val, &mut interner_new);
+        let decoded_value = decode_value(decoded_net_val, &mut interner_new).unwrap();
 
         let new_str = format!("{}", decoded_value);
 
@@ -562,9 +726,9 @@ mod tests {
             service_name: service,
         };
 
-        let encoded = encode_value(&original_value, &interner_orig);
+        let encoded = encode_value(&original_value, &interner_orig).unwrap();
         let mut interner_new = Interner::new();
-        let decoded = decode_value(encoded, &mut interner_new);
+        let decoded = decode_value(encoded, &mut interner_new).unwrap();
 
         assert_eq!(format!("{}", original_value), format!("{}", decoded));
     }
@@ -574,9 +738,9 @@ mod tests {
     #[test]
     fn test_expr_codec_exhaustive_1() {
         let run_expr_test = |expr: &Expr, interner_orig: &Interner| {
-            let encoded = encode_expr(expr, interner_orig);
+            let encoded = encode_expr(expr, interner_orig).unwrap();
             let mut interner_new = Interner::new();
-            let decoded = decode_expr(encoded, &mut interner_new);
+            let decoded = decode_expr(encoded, &mut interner_new).unwrap();
             assert_eq!(format!("{}", expr), format!("{}", decoded));
         };
 
@@ -664,9 +828,9 @@ mod tests {
     #[test]
     fn test_expr_codec_exhaustive_2() {
         let run_expr_test = |expr: &Expr, interner_orig: &Interner| {
-            let encoded = encode_expr(expr, interner_orig);
+            let encoded = encode_expr(expr, interner_orig).unwrap();
             let mut interner_new = Interner::new();
-            let decoded = decode_expr(encoded, &mut interner_new);
+            let decoded = decode_expr(encoded, &mut interner_new).unwrap();
             assert_eq!(format!("{}", expr), format!("{}", decoded));
         };
 
@@ -721,9 +885,9 @@ mod tests {
     #[test]
     fn test_expr_codec_exhaustive_3() {
         let run_expr_test = |expr: &Expr, interner_orig: &Interner| {
-            let encoded = encode_expr(expr, interner_orig);
+            let encoded = encode_expr(expr, interner_orig).unwrap();
             let mut interner_new = Interner::new();
-            let decoded = decode_expr(encoded, &mut interner_new);
+            let decoded = decode_expr(encoded, &mut interner_new).unwrap();
             assert_eq!(format!("{}", expr), format!("{}", decoded));
         };
 
@@ -789,9 +953,9 @@ mod tests {
     #[test]
     fn test_action_stmt_codec_exhaustive() {
         let run_stmt_test = |stmt: &ActionStmt, interner_orig: &Interner| {
-            let encoded = encode_action_stmt(stmt, interner_orig);
+            let encoded = encode_action_stmt(stmt, interner_orig).unwrap();
             let mut interner_new = Interner::new();
-            let decoded = decode_action_stmt(encoded, &mut interner_new);
+            let decoded = decode_action_stmt(encoded, &mut interner_new).unwrap();
             assert_eq!(format!("{}", stmt), format!("{}", decoded));
         };
 
@@ -833,7 +997,7 @@ mod tests {
     #[test]
     fn test_codec_corrupt_payload_rejection() {
         let malformed_json = "{ \"val\": { \"Closure\": { \"params\": [";
-        let res: Result<NetValue, _> = serde_json::from_str(malformed_json);
+        let res: std::result::Result<NetValue, _> = serde_json::from_str(malformed_json);
         assert!(res.is_err() == true);
     }
 
@@ -842,7 +1006,7 @@ mod tests {
     #[test]
     fn test_codec_type_mismatch_rejection() {
         let mismatched_json = "{ \"Bool\": { \"val\": \"not_a_bool\" } }";
-        let res: Result<NetValue, _> = serde_json::from_str(mismatched_json);
+        let res: std::result::Result<NetValue, _> = serde_json::from_str(mismatched_json);
         assert!(res.is_err() == true);
     }
 
@@ -864,11 +1028,54 @@ mod tests {
             };
         }
 
-        let encoded = encode_expr(&expr, &interner);
+        let encoded = encode_expr(&expr, &interner).unwrap();
         let json_str = serde_json::to_string(&encoded).unwrap();
         let decoded_net: NetExpr = serde_json::from_str(&json_str).unwrap();
-        let decoded = decode_expr(decoded_net, &mut interner);
+        let decoded = decode_expr(decoded_net, &mut interner).unwrap();
 
         assert_eq!(format!("{}", expr), format!("{}", decoded));
+    }
+
+    /// Verify that decoding a value with an oversized string
+    /// literal fails
+    #[test]
+    fn test_codec_decode_oversized_string_literal() {
+        let long_str = "a".repeat(MAX_STRING_LITERAL_LENGTH + 1);
+        let net_val = NetValue::String { val: long_str };
+        let mut interner = Interner::new();
+        let res = decode_value(net_val, &mut interner);
+        assert!(res.is_err() == true);
+        assert!(matches!(res.unwrap_err(), Error::LimitExceeded(_)));
+    }
+
+    /// Verify that decoding a value with an oversized identifier
+    /// fails
+    #[test]
+    fn test_codec_decode_oversized_identifier() {
+        let long_ident = "a".repeat(MAX_IDENTIFIER_LENGTH + 1);
+        let net_val = NetValue::Closure {
+            params: vec![long_ident],
+            body: Box::new(NetExpr::Literal {
+                val: NetValue::Number { val: 0 },
+            }),
+            env: vec![],
+            service_name: "test".to_string(),
+        };
+        let mut interner = Interner::new();
+        let res = decode_value(net_val, &mut interner);
+        assert!(res.is_err() == true);
+        assert!(matches!(res.unwrap_err(), Error::LimitExceeded(_)));
+    }
+
+    /// Verify that encoding a value with an oversized string
+    /// literal fails
+    #[test]
+    fn test_codec_encode_oversized_string_literal() {
+        let long_str = "a".repeat(MAX_STRING_LITERAL_LENGTH + 1);
+        let val = Value::String { val: long_str };
+        let interner = Interner::new();
+        let res = encode_value(&val, &interner);
+        assert!(res.is_err() == true);
+        assert!(matches!(res.unwrap_err(), Error::LimitExceeded(_)));
     }
 }

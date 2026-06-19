@@ -7,7 +7,7 @@ use meerkat_lib::net::NetworkActor;
 use meerkat_lib::net::{
     codec, Address, MeerkatMessage, NetworkCommand, NetworkEvent, NetworkReply, ServiceNetId,
 };
-use meerkat_lib::runtime::ast::{ActionStmt, AstPrinter, Stmt, Value};
+use meerkat_lib::runtime::ast::{AstPrinter, Stmt};
 use meerkat_lib::runtime::interner::{Interner, Symbol};
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::ParkedRequest;
@@ -192,9 +192,15 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                     );
                 }
                 Ok(val) => {
-                    let response = MeerkatMessage::LookupResponse {
-                        request_id,
-                        value: codec::encode_value(&val, &manager.interner),
+                    let response = match codec::encode_value(&val, &manager.interner) {
+                        Ok(enc_val) => MeerkatMessage::LookupResponse {
+                            request_id,
+                            value: enc_val,
+                        },
+                        Err(e) => MeerkatMessage::LookupError {
+                            request_id,
+                            error: e.to_string(),
+                        },
                     };
                     if let Some(net) = manager.network.as_mut() {
                         net.handle_command(NetworkCommand::SendMessage {
@@ -347,9 +353,15 @@ async fn run_server(
                         None => {
                             let result = manager.lookup(mem_sym, svc_sym, None).await;
                             let response = match result {
-                                Ok(val) => MeerkatMessage::LookupResponse {
-                                    request_id,
-                                    value: codec::encode_value(&val, &manager.interner),
+                                Ok(val) => match codec::encode_value(&val, &manager.interner) {
+                                    Ok(enc_val) => MeerkatMessage::LookupResponse {
+                                        request_id,
+                                        value: enc_val,
+                                    },
+                                    Err(e) => MeerkatMessage::LookupError {
+                                        request_id,
+                                        error: e.to_string(),
+                                    },
                                 },
                                 Err(e) => MeerkatMessage::LookupError {
                                     request_id,
@@ -375,19 +387,47 @@ async fn run_server(
                     txn_id,
                 } => {
                     let svc_sym = manager.interner.insert(&service);
-                    let local_stmts: Vec<ActionStmt> = stmts
-                        .into_iter()
-                        .map(|s| codec::decode_action_stmt(s, &mut manager.interner))
-                        .collect();
-                    let local_env: Vec<(Symbol, Value)> = action_env
-                        .into_iter()
-                        .map(|(k, v)| {
-                            (
-                                manager.interner.insert(&k),
-                                codec::decode_value(v, &mut manager.interner),
-                            )
-                        })
-                        .collect();
+                    let mut local_stmts = Vec::new();
+                    let mut decode_failed = false;
+                    let mut error_msg = None;
+                    for s in stmts {
+                        match codec::decode_action_stmt(s, &mut manager.interner) {
+                            Ok(ds) => local_stmts.push(ds),
+                            Err(e) => {
+                                decode_failed = true;
+                                error_msg = Some(e.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    let mut local_env = Vec::new();
+                    if !decode_failed {
+                        for (k, v) in action_env {
+                            match codec::decode_value(v, &mut manager.interner) {
+                                Ok(dv) => local_env.push((manager.interner.insert(&k), dv)),
+                                Err(e) => {
+                                    decode_failed = true;
+                                    error_msg = Some(e.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if decode_failed {
+                        let response = MeerkatMessage::ActionResponse {
+                            request_id,
+                            success: false,
+                            error: error_msg,
+                        };
+                        if let Some(net) = manager.network.as_mut() {
+                            net.handle_command(NetworkCommand::SendMessage {
+                                addr: Address::new(&reply_to),
+                                msg: response,
+                            })
+                            .await;
+                        }
+                        continue;
+                    }
                     match txn_id {
                         // Part of a distributed transaction: park if older
                         // than a holder, otherwise reply

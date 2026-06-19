@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod interner;
 pub mod interpreter;
+pub mod limits;
 pub mod manager;
 pub mod parser;
 pub mod semantic_analysis;

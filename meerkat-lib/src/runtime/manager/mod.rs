@@ -758,7 +758,8 @@ impl Manager {
 
         match reply {
             MeerkatMessage::LookupResponse { value, .. } => {
-                let val = codec::decode_value(value, &mut self.interner);
+                let val = codec::decode_value(value, &mut self.interner)
+                    .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
                 Ok(val)
             }
             MeerkatMessage::LookupError { error, .. } => Err(EvalError::LocalDispatchFailed(error)),
@@ -849,20 +850,21 @@ impl Manager {
             }
         }
 
-        let net_stmts = stmts
-            .iter()
-            .map(|s| codec::encode_action_stmt(s, &self.interner))
-            .collect();
+        let mut net_stmts = Vec::new();
+        for s in &stmts {
+            net_stmts.push(
+                codec::encode_action_stmt(s, &self.interner)
+                    .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?,
+            );
+        }
 
-        let net_env = env
-            .into_iter()
-            .map(|(sym, val)| {
-                (
-                    self.interner.get(sym).to_string(),
-                    codec::encode_value(&val, &self.interner),
-                )
-            })
-            .collect();
+        let mut net_env = Vec::new();
+        for (sym, val) in env {
+            let key_str = self.interner.get(sym).to_string();
+            let enc_val = codec::encode_value(&val, &self.interner)
+                .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
+            net_env.push((key_str, enc_val));
+        }
 
         let msg = MeerkatMessage::ActionRequest {
             request_id,
