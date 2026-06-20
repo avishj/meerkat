@@ -168,7 +168,7 @@ impl<'a> AstPrinter<'a> {
                 self.print_expr(expr, indent + 1);
             }
             ActionStmt::Assert(expr, text) => {
-                println!("Assert: {{ text: \"{}\" }}", text);
+                println!("Assert: {{ text: {:?} }}", text);
                 self.print_expr(expr, indent + 1);
             }
             ActionStmt::Assign { name, expr } => {
